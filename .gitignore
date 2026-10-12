@@ -98,3 +98,6 @@ web/dist/
 # 开发服务器端口文件
 .host
 .port
+
+# 沙箱文件权限修复的备份与恢复记录
+.dsh-acl-recovery/
