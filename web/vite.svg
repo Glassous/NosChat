@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <circle cx="50" cy="50" r="45" fill="#646cff"/>
+  <path d="M30,30 L70,30 L70,70 L30,70 Z" fill="white" stroke="#646cff" stroke-width="5"/>
+  <text x="50" y="58" text-anchor="middle" fill="#646cff" font-size="24" font-weight="bold">V</text>
+</svg>

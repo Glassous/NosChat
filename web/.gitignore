@@ -1,0 +1,51 @@
+# Vue + Vite 项目标准忽略规则
+
+# 依赖目录
+node_modules/
+.pnpm-store/
+
+# 构建输出
+dist/
+dist-ssr/
+*.local
+
+# 日志文件
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# 编辑器/IDE 文件
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 环境变量文件
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# 临时文件
+.nyc_output
+coverage/
+
+# 类型生成文件
+*.tsbuildinfo
+
+# 缓存目录
+.vite/
+.cache/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 其他
+*.log
