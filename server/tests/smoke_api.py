@@ -43,6 +43,16 @@ def main() -> None:
     nickname = "冒烟测试"
     print(f"目标后端：{base}\n测试邮箱：{email}\n")
 
+    def _code_of(response: httpx.Response) -> str:
+        """开发模式取回传验证码；真实 SMTP 场景用 --code 传入邮箱收到的验证码。"""
+        dev = response.json().get("devCode")
+        if not dev and not args.code.strip():
+            _fail(
+                "未拿到验证码：未配置 SMTP 时需 AUTH_DEV_ECHO_CODE=true；"
+                "已配置真实 SMTP 时请用 --code 传入验证码"
+            )
+        return dev or args.code.strip()
+
     # trust_env=False：避免本机代理软件拦截 localhost 请求
     with httpx.Client(timeout=30.0, trust_env=False) as client:
         # 1. 健康检查
@@ -178,6 +188,92 @@ def main() -> None:
         if unauth.status_code != 401:
             _fail(f"未授权访问应返回 401：{unauth.status_code}")
         _ok("未授权访问拦截通过")
+
+        # 13. 验证码登录：未注册邮箱自动注册，昵称留空则使用邮箱
+        code_email = f"smoke-code-{int(time.time())}@example.com"
+        login_code_resp = client.post(
+            f"{api}/auth/send-code", json={"email": code_email, "purpose": "login"}
+        )
+        if login_code_resp.status_code != 200:
+            _fail(f"登录验证码发送失败：{login_code_resp.status_code} {login_code_resp.text}")
+        auto = client.post(
+            f"{api}/auth/login-code",
+            json={"email": code_email, "code": _code_of(login_code_resp), "nickname": ""},
+        )
+        if auto.status_code != 200:
+            _fail(f"验证码登录失败：{auto.status_code} {auto.text}")
+        auto_data = auto.json()
+        if not auto_data.get("isNewUser"):
+            _fail(f"未标记为自动注册：{auto_data}")
+        if auto_data["user"]["nickname"] != code_email:
+            _fail(f"昵称应回退为邮箱，实际为：{auto_data['user']['nickname']}")
+        auto_auth = {"Authorization": f"Bearer {auto_data['token']}"}
+        if client.get(f"{api}/auth/me", headers=auto_auth).status_code != 200:
+            _fail("自动注册账号的令牌不可用")
+        _ok(f"验证码登录自动注册：nickname={auto_data['user']['nickname']}")
+
+        # 13.1 昵称设置：可修改；留空则回退为邮箱
+        updated = client.patch(
+            f"{api}/auth/me", headers=auto_auth, json={"nickname": "自动注册用户"}
+        )
+        if updated.status_code != 200 or updated.json()["nickname"] != "自动注册用户":
+            _fail(f"昵称更新失败：{updated.status_code} {updated.text}")
+        cleared = client.patch(f"{api}/auth/me", headers=auto_auth, json={"nickname": ""})
+        if cleared.status_code != 200 or cleared.json()["nickname"] != code_email:
+            _fail(f"清空昵称应回退为邮箱：{cleared.status_code} {cleared.text}")
+        _ok("昵称设置：可更新，留空回退为邮箱")
+
+        # 14. 验证码登录：已注册邮箱不新建账号、也不覆盖昵称
+        existing_code_resp = client.post(
+            f"{api}/auth/send-code", json={"email": email, "purpose": "login"}
+        )
+        if existing_code_resp.status_code != 200:
+            _fail(f"已注册邮箱登录验证码发送失败：{existing_code_resp.status_code} {existing_code_resp.text}")
+        existing = client.post(
+            f"{api}/auth/login-code",
+            json={
+                "email": email,
+                "code": _code_of(existing_code_resp),
+                "nickname": "不应生效的昵称",
+            },
+        )
+        if existing.status_code != 200:
+            _fail(f"已注册邮箱验证码登录失败：{existing.status_code} {existing.text}")
+        if existing.json().get("isNewUser") or existing.json()["user"]["nickname"] != nickname:
+            _fail(f"已注册邮箱不应被改动：{existing.json()}")
+        _ok("已注册邮箱验证码登录：未新建账号、昵称未被覆盖")
+
+        # 15. 找回密码：新密码可登录，旧密码与旧令牌全部失效
+        reset_code_resp = client.post(
+            f"{api}/auth/send-code", json={"email": email, "purpose": "reset"}
+        )
+        if reset_code_resp.status_code != 200:
+            _fail(f"重置密码验证码发送失败：{reset_code_resp.status_code} {reset_code_resp.text}")
+        new_password = "smoke-pass-456"
+        reset = client.post(
+            f"{api}/auth/reset-password",
+            json={"email": email, "code": _code_of(reset_code_resp), "password": new_password},
+        )
+        if reset.status_code != 200:
+            _fail(f"重置密码失败：{reset.status_code} {reset.text}")
+        if client.post(f"{api}/auth/login", json={"email": email, "password": password}).status_code != 401:
+            _fail("重置后旧密码仍可登录")
+        if client.post(f"{api}/auth/login", json={"email": email, "password": new_password}).status_code != 200:
+            _fail("重置后新密码无法登录")
+        if client.get(f"{api}/auth/me", headers=auth).status_code != 401:
+            _fail("重置密码后旧令牌未失效")
+        reset_auth = {"Authorization": f"Bearer {reset.json()['token']}"}
+        if client.get(f"{api}/auth/me", headers=reset_auth).status_code != 200:
+            _fail("重置密码返回的新令牌不可用")
+        _ok("找回密码：新密码可用，旧密码与旧令牌已失效")
+
+        # 16. 验证码用途校验
+        if client.post(f"{api}/auth/send-code", json={"email": email, "purpose": "register"}).status_code != 409:
+            _fail("已注册邮箱不应允许注册用途验证码")
+        unknown_email = f"nobody-{int(time.time())}@example.com"
+        if client.post(f"{api}/auth/send-code", json={"email": unknown_email, "purpose": "reset"}).status_code != 404:
+            _fail("未注册邮箱不应允许重置密码验证码")
+        _ok("验证码用途校验通过（register 需未注册 / reset 需已注册）")
 
     print("\n全部冒烟用例通过")
 

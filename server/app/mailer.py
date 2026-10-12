@@ -32,12 +32,24 @@ def _sender() -> str:
     return formataddr((settings.smtp_from_name, raw))
 
 
-def build_verification_email(code: str, ttl_minutes: int) -> tuple[str, str, str]:
+# 不同用途的邮件文案：label 用于标题，action 用于正文首句
+_PURPOSE_TEXT: dict[str, tuple[str, str]] = {
+    "register": ("注册", "你正在注册 {app} 账号。"),
+    "login": ("登录", "你正在登录 {app} 账号。"),
+    "reset": ("重置密码", "你正在重置 {app} 账号的密码。"),
+}
+
+
+def build_verification_email(
+    code: str, ttl_minutes: int, purpose: str = "register"
+) -> tuple[str, str, str]:
     """返回 (subject, text, html)。"""
     settings = get_settings()
-    subject = f"【{settings.smtp_from_name}】注册验证码：{code}"
+    label, action_tpl = _PURPOSE_TEXT.get(purpose, _PURPOSE_TEXT["register"])
+    app = settings.smtp_from_name
+    subject = f"【{app}】{label}验证码：{code}"
     text = (
-        f"你正在注册 {settings.smtp_from_name} 账号。\n\n"
+        f"{action_tpl.format(app=app)}\n\n"
         f"验证码：{code}\n"
         f"有效期：{ttl_minutes} 分钟\n\n"
         "如果这不是你的操作，请忽略本邮件。"
@@ -45,8 +57,8 @@ def build_verification_email(code: str, ttl_minutes: int) -> tuple[str, str, str
     html = f"""\
 <div style="font-family:-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
             max-width:520px;margin:0 auto;padding:32px 24px;color:#1e293b;">
-  <h2 style="margin:0 0 8px;font-size:20px;">{settings.smtp_from_name} 注册验证</h2>
-  <p style="margin:0 0 20px;color:#64748b;font-size:14px;">请使用下方验证码完成注册，有效期 {ttl_minutes} 分钟。</p>
+  <h2 style="margin:0 0 8px;font-size:20px;">{app} {label}验证</h2>
+  <p style="margin:0 0 20px;color:#64748b;font-size:14px;">请使用下方验证码完成{label}，有效期 {ttl_minutes} 分钟。</p>
   <div style="background:linear-gradient(135deg,#667eea,#764ba2);border-radius:12px;padding:18px;
               text-align:center;color:#fff;font-size:30px;font-weight:700;letter-spacing:8px;">
     {code}
@@ -92,7 +104,9 @@ async def send_email(to: str, subject: str, text: str, html: str | None = None) 
         raise MailError("验证码邮件发送失败，请稍后重试") from exc
 
 
-async def send_verification_code(to: str, code: str, ttl_seconds: int) -> None:
-    """发送注册验证码邮件。"""
-    subject, text, html = build_verification_email(code, max(1, ttl_seconds // 60))
+async def send_verification_code(
+    to: str, code: str, ttl_seconds: int, purpose: str = "register"
+) -> None:
+    """发送验证码邮件（注册 / 登录 / 重置密码）。"""
+    subject, text, html = build_verification_email(code, max(1, ttl_seconds // 60), purpose)
     await send_email(to, subject, text, html)

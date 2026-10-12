@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -49,13 +50,23 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+# 轻量迁移：create_all 只会新建缺失的表，不会为已有表补列。
+# 这里显式补齐新增列（PostgreSQL 支持 IF NOT EXISTS，可重复执行）。
+_LIGHT_MIGRATIONS: tuple[str, ...] = (
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0",
+)
+
+
 async def init_db() -> None:
-    """建表（幂等）。启动阶段调用。"""
+    """建表 + 补齐新增列（幂等）。启动阶段调用。"""
     # 触发 ORM 元数据注册
     from . import models  # noqa: F401
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if settings.database_url.startswith("postgresql"):
+            for statement in _LIGHT_MIGRATIONS:
+                await conn.execute(text(statement))
     logger.info("数据库表结构已就绪")
 
 

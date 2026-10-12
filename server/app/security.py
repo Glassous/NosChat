@@ -36,8 +36,15 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(subject: str | int, expires_minutes: int | None = None) -> tuple[str, int]:
-    """签发访问令牌，返回 (token, 有效期秒数)。"""
+def create_access_token(
+    subject: str | int,
+    expires_minutes: int | None = None,
+    token_version: int = 0,
+) -> tuple[str, int]:
+    """签发访问令牌，返回 (token, 有效期秒数)。
+
+    token_version 与用户当前版本比较，用于在重置密码后作废旧令牌。
+    """
     settings = get_settings()
     minutes = expires_minutes or settings.access_token_expire_minutes
     now = datetime.now(timezone.utc)
@@ -45,6 +52,7 @@ def create_access_token(subject: str | int, expires_minutes: int | None = None) 
     payload: dict[str, Any] = {
         "sub": str(subject),
         "type": "access",
+        "ver": int(token_version or 0),
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
     }

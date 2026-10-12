@@ -1,4 +1,4 @@
-# NosChat - AI 聊天应用（全栈版）
+# NosChat - 复古 AI 聊天应用
 
 Vue 3 前端 + FastAPI 后端 + PostgreSQL 的 AI 聊天应用：真实的 OpenAI 兼容模型调用、SSE 流式输出、邮箱验证码注册登录、按用户持久化会话与消息，并提供容器化部署（容器只包含后端与数据库，**不含前端**）。
 
@@ -11,15 +11,18 @@ Vue 3 前端 + FastAPI 后端 + PostgreSQL 的 AI 聊天应用：真实的 OpenA
 - 💬 **多对话管理**：会话列表来自后端并持久化，支持新建、重命名、删除
 - 🧠 **深度思考展示**：推理模型先输出思考链，可逐条展开/折叠（由后端真实 `reasoning` 增量驱动）
 - 🧩 **多模型切换**：模型清单由后端下发，含厂商、上下文、能力条、**介绍**与**发布日期**，支持按发布时间排序与搜索
-- 🔐 **登录 / 注册**：邮箱 + 密码登录，注册需邮箱验证码
+- 🔐 **多种登录方式**：邮箱 + 密码登录、邮箱验证码登录（免密码）
+- 😊 **昵称设置**：自动注册后弹出昵称设置；顶部昵称可随时点击修改
+- ✉️ **注册 / 找回密码**：邮箱验证码注册；忘记密码可通过邮箱验证码重置
+- 🆕 **验证码登录自动注册**：邮箱未注册时直接创建账号（昵称默认使用邮箱）
 - 📱 **响应式设计**：桌面端内联侧栏、窄屏抽屉（原样保留）
 
 ### 后端
 - 🚀 **FastAPI**（默认 `9135` 端口）+ PostgreSQL（SQLAlchemy 2.x 异步 + psycopg3）
 - 🤖 **真实模型调用**：一个 `OPENAI_BASE_URL` + 一个 `OPENAI_API_KEY` + 多个 model（OpenAI 标准接口）
 - 🌊 **SSE 流式转发**：思考内容与正式回答分别流式下发，前端逐字渲染
-- ✉️ **SMTP 邮件验证码**：注册前校验邮箱验证码（哈希存储、有效期、重发限流、错误次数限制）
-- 🔑 **密码与令牌**：bcrypt 密码哈希 + JWT 访问令牌
+- ✉️ **SMTP 邮件验证码**：按用途（注册 / 登录 / 重置）分别校验与限流（哈希存储、有效期、重发间隔、错误次数限制）
+- 🔑 **密码与令牌**：bcrypt 密码哈希 + JWT 访问令牌，重置密码后旧令牌立即失效
 - 🗂️ **会话与消息持久化**：按用户隔离，自动生成标题与预览
 - ⚙️ **环境变量驱动**：数据库、密钥、邮件、模型、CORS 等全部可配置
 - 🐳 **容器化部署**：`docker compose` 一键起后端 + PostgreSQL（不含前端）
@@ -76,7 +79,7 @@ NosChat/
 │       ├── utils/time.js                     # 新增：时间展示格式化
 │       ├── stores/userStore.js               # 改造：对接后端鉴权（保留原暴露字段）
 │       ├── data/models.js                    # 改造：模型清单运行时注册表
-│       ├── components/AuthPage.vue           # 增补：邮箱 + 验证码输入项
+│       ├── components/AuthPage.vue           # 增补：密码/验证码登录、注册、找回密码
 │       ├── components/ModelSelector.vue      # 微调：清单为空时的兜底，避免渲染报错
 │       ├── App.vue                           # 改造：真实模型清单 / SSE / 会话持久化（模板不变）
 │       └── ...                               # 其余组件未改动
@@ -200,10 +203,13 @@ docker compose restart api        # 或本地：重跑 python run.py
 | 方法 | 路径 | 说明 | 鉴权 |
 | --- | --- | --- | --- |
 | GET | `/health` | 健康检查（含已加载模型数） | 否 |
-| POST | `/api/auth/send-code` | 发送注册验证码（同邮箱 60s 限流） | 否 |
-| POST | `/api/auth/register` | 邮箱验证码注册（成功即返回令牌） | 否 |
+| POST | `/api/auth/send-code` | 发送验证码，`purpose` 取 `register`/`login`/`reset`（同邮箱同用途 60s 限流） | 否 |
+| POST | `/api/auth/register` | 邮箱验证码注册（成功即返回令牌；昵称留空则用邮箱） | 否 |
 | POST | `/api/auth/login` | 邮箱 + 密码登录 | 否 |
+| POST | `/api/auth/login-code` | 邮箱验证码登录，**未注册的邮箱自动注册**（`isNewUser` 标识） | 否 |
+| POST | `/api/auth/reset-password` | 找回密码：验证码校验后重置密码，旧令牌全部失效 | 否 |
 | GET | `/api/auth/me` | 当前登录用户 | 是 |
+| PATCH | `/api/auth/me` | 更新昵称（留空则回退为邮箱） | 是 |
 | GET | `/api/models` | 模型清单（含介绍 / 发布日期等） | 否 |
 | GET | `/api/conversations` | 会话列表（置顶优先、按更新时间倒序） | 是 |
 | POST | `/api/conversations` | 新建会话（附带欢迎消息） | 是 |
@@ -211,6 +217,17 @@ docker compose restart api        # 或本地：重跑 python run.py
 | PATCH | `/api/conversations/{id}` | 更新标题 / 模型 / 置顶 / 未读 | 是 |
 | DELETE | `/api/conversations/{id}` | 删除会话（级联删除消息） | 是 |
 | POST | `/api/chat/stream` | 流式对话（`text/event-stream`） | 是 |
+
+### 认证流程
+
+| 场景 | 接口步骤 | 说明 |
+| --- | --- | --- |
+| 注册 | `send-code(register)` → `register` | 邮箱必须未注册；需昵称与密码，成功即登录 |
+| 验证码登录 | `send-code(login)` → `login-code` | 邮箱已注册则直接登录；**未注册则自动创建账号**（昵称默认使用邮箱，且该账号没有密码）。自动注册后前端会弹出昵称设置框，可填昵称或选择「用邮箱当昵称」 |
+| 密码登录 | `login` | 验证码自动注册的账号可用「找回密码」设置密码后再用密码登录 |
+| 找回密码 | `send-code(reset)` → `reset-password` | 邮箱必须已注册；重置成功即登录，此前签发的令牌全部失效 |
+
+> 验证码按 `(邮箱, 用途)` 独立记录与限流：有效期 `CODE_TTL_SECONDS`（默认 300s）、重发间隔 `CODE_RESEND_INTERVAL_SECONDS`（默认 60s）、最大尝试次数 `CODE_MAX_ATTEMPTS`（默认 5 次）。
 
 ### SSE 事件格式
 

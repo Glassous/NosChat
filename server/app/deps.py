@@ -59,6 +59,15 @@ async def get_current_user(
             detail="账号不存在或已被移除",
             headers=_UNAUTHORIZED_HEADERS,
         )
+
+    # 重置密码后版本号 +1，旧令牌立即失效
+    token_version = int(payload.get("ver", 0) or 0)
+    if token_version != int(user.token_version or 0):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="登录状态已失效，请重新登录",
+            headers=_UNAUTHORIZED_HEADERS,
+        )
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

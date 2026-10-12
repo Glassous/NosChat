@@ -25,8 +25,10 @@ class CamelModel(BaseModel):
 
 
 class SendCodeRequest(CamelModel):
+    """purposes: register 注册 / login 验证码登录 / reset 找回密码。"""
+
     email: EmailStr
-    purpose: Literal["register"] = "register"
+    purpose: Literal["register", "login", "reset"] = "register"
 
 
 class SendCodeResponse(CamelModel):
@@ -39,13 +41,37 @@ class SendCodeResponse(CamelModel):
 class RegisterRequest(CamelModel):
     email: EmailStr
     code: str = Field(min_length=4, max_length=8)
-    nickname: str = Field(min_length=1, max_length=32)
+    # 昵称留空时将使用邮箱
+    nickname: str = Field(default="", max_length=32)
+    password: str = Field(min_length=6, max_length=64)
+
+
+class CodeLoginRequest(CamelModel):
+    """邮箱验证码登录：邮箱未注册时自动注册。"""
+
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=8)
+    # 仅首次（自动注册）时使用；留空则用邮箱作为昵称
+    nickname: str = Field(default="", max_length=32)
+
+
+class ResetPasswordRequest(CamelModel):
+    """找回密码：邮箱验证码校验通过后设置新密码。"""
+
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=8)
     password: str = Field(min_length=6, max_length=64)
 
 
 class LoginRequest(CamelModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=64)
+
+
+class UpdateProfileRequest(CamelModel):
+    """更新个人资料；昵称留空时回退为邮箱。"""
+
+    nickname: str = Field(default="", max_length=32)
 
 
 class UserOut(CamelModel):
@@ -61,6 +87,8 @@ class TokenResponse(CamelModel):
     token_type: str = "bearer"
     expires_in: int
     user: UserOut
+    # 验证码登录时是否刚刚自动注册
+    is_new_user: bool = False
 
 
 # ---------------------------------------------------------------- 模型清单

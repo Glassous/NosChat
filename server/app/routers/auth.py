@@ -1,13 +1,15 @@
-"""认证路由：邮箱验证码注册、登录、当前用户。"""
+"""认证路由：验证码注册、验证码登录（未注册自动注册）、找回密码、密码登录。"""
 
 from __future__ import annotations
 
 import logging
 import math
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -16,11 +18,14 @@ from ..deps import get_current_user
 from ..mailer import MailError, send_verification_code
 from ..models import EmailVerification, User, utcnow
 from ..schemas import (
+    CodeLoginRequest,
     LoginRequest,
     RegisterRequest,
+    ResetPasswordRequest,
     SendCodeRequest,
     SendCodeResponse,
     TokenResponse,
+    UpdateProfileRequest,
     UserOut,
     user_out,
 )
@@ -38,8 +43,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 PURPOSE_REGISTER = "register"
+PURPOSE_LOGIN = "login"
+PURPOSE_RESET = "reset"
+
 # 过期验证码记录的保留时长
 _RECORD_RETENTION = timedelta(hours=24)
+# 验证码自动注册的账号没有密码，写入不可用的随机哈希（可用「找回密码」设置新密码）
+_UNUSABLE_PASSWORD_BYTES = 32
 
 
 def _as_aware(value: datetime | None) -> datetime | None:
@@ -53,6 +63,23 @@ def _as_aware(value: datetime | None) -> datetime | None:
 
 def _normalize_email(email: str) -> str:
     return email.strip().lower()
+
+
+def _default_nickname(nickname: str | None, email: str) -> str:
+    """昵称留空时使用邮箱（需求：不填昵称就把邮箱填入昵称）。"""
+    value = (nickname or "").strip()
+    return value[:64] if value else email
+
+
+def _token_response(user: User, is_new_user: bool = False) -> TokenResponse:
+    token, expires_in = create_access_token(user.id, token_version=user.token_version)
+    return TokenResponse(
+        token=token,
+        token_type="bearer",
+        expires_in=expires_in,
+        user=user_out(user),
+        is_new_user=is_new_user,
+    )
 
 
 async def _latest_code(
@@ -70,19 +97,59 @@ async def _latest_code(
     return await db.scalar(stmt)
 
 
-@router.post("/send-code", response_model=SendCodeResponse, summary="发送注册验证码")
+async def _consume_code(db: AsyncSession, email: str, purpose: str, code: str) -> None:
+    """校验验证码并标记为已使用；失败时抛出 HTTPException。
+
+    标记结果由调用方统一提交，若后续步骤失败会一并回滚。
+    """
+    settings = get_settings()
+    record = await _latest_code(db, email, purpose)
+    if record is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "请先获取邮箱验证码")
+
+    now = utcnow()
+    if record.consumed_at is not None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "验证码已使用，请重新获取")
+    expires_at = _as_aware(record.expires_at)
+    if expires_at is not None and expires_at <= now:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "验证码已过期，请重新获取")
+    if record.attempts >= settings.code_max_attempts:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "验证码尝试次数过多，请重新获取")
+
+    if not verify_code(code.strip(), record.code_hash):
+        record.attempts += 1
+        await db.commit()
+        remaining = max(0, settings.code_max_attempts - record.attempts)
+        message = "验证码不正确" if remaining else "验证码错误次数过多，请重新获取"
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, message)
+
+    record.consumed_at = now
+    await db.flush()
+
+
+@router.post("/send-code", response_model=SendCodeResponse, summary="发送邮箱验证码")
 async def send_code(
     payload: SendCodeRequest,
     db: AsyncSession = Depends(get_db),
 ) -> SendCodeResponse:
+    """按用途发送验证码：register 注册 / login 验证码登录 / reset 找回密码。
+
+    - register：邮箱必须未注册；
+    - login：不限制（未注册时由验证码登录自动注册）；
+    - reset：邮箱必须已注册。
+    """
     settings = get_settings()
     email = _normalize_email(payload.email)
+    purpose = payload.purpose
 
-    if await db.scalar(select(User.id).where(User.email == email)) is not None:
+    user_exists = await db.scalar(select(User.id).where(User.email == email)) is not None
+    if purpose == PURPOSE_REGISTER and user_exists:
         raise HTTPException(status.HTTP_409_CONFLICT, "该邮箱已注册，请直接登录")
+    if purpose == PURPOSE_RESET and not user_exists:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "该邮箱尚未注册，请先注册")
 
     now = utcnow()
-    latest = await _latest_code(db, email, PURPOSE_REGISTER)
+    latest = await _latest_code(db, email, purpose)
     latest_at = _as_aware(latest.created_at) if latest else None
     if latest_at is not None:
         elapsed = (now - latest_at).total_seconds()
@@ -95,7 +162,7 @@ async def send_code(
     code = generate_code()
     record = EmailVerification(
         email=email,
-        purpose=PURPOSE_REGISTER,
+        purpose=purpose,
         code_hash=hash_code(code),
         expires_at=now + timedelta(seconds=settings.code_ttl_seconds),
     )
@@ -112,14 +179,14 @@ async def send_code(
     dev_code: str | None = None
     if settings.smtp_enabled:
         try:
-            await send_verification_code(email, code, settings.code_ttl_seconds)
+            await send_verification_code(email, code, settings.code_ttl_seconds, purpose)
         except MailError as exc:
-            logger.warning("验证码邮件发送失败（%s）：%s", email, exc)
+            logger.warning("验证码邮件发送失败（%s/%s）：%s", email, purpose, exc)
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     elif settings.auth_dev_echo_code:
         # 本地开发：未配置 SMTP 时把验证码回传，便于自测
         dev_code = code
-        logger.info("SMTP 未配置，开发模式返回验证码：%s -> %s", email, code)
+        logger.info("SMTP 未配置，开发模式返回验证码：%s/%s -> %s", email, purpose, code)
     else:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -144,36 +211,16 @@ async def register(
     payload: RegisterRequest,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
-    settings = get_settings()
     email = _normalize_email(payload.email)
 
     if await db.scalar(select(User.id).where(User.email == email)) is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "该邮箱已注册，请直接登录")
 
-    record = await _latest_code(db, email, PURPOSE_REGISTER)
-    if record is None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "请先获取邮箱验证码")
+    await _consume_code(db, email, PURPOSE_REGISTER, payload.code)
 
-    now = utcnow()
-    if record.consumed_at is not None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "验证码已使用，请重新获取")
-    expires_at = _as_aware(record.expires_at)
-    if expires_at is not None and expires_at <= now:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "验证码已过期，请重新获取")
-    if record.attempts >= settings.code_max_attempts:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "验证码尝试次数过多，请重新获取")
-
-    if not verify_code(payload.code.strip(), record.code_hash):
-        record.attempts += 1
-        await db.commit()
-        remaining = max(0, settings.code_max_attempts - record.attempts)
-        message = "验证码不正确" if remaining else "验证码错误次数过多，请重新获取"
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, message)
-
-    record.consumed_at = now
     user = User(
         email=email,
-        nickname=payload.nickname.strip(),
+        nickname=_default_nickname(payload.nickname, email),
         hashed_password=hash_password(payload.password),
     )
     db.add(user)
@@ -181,9 +228,7 @@ async def register(
     await db.refresh(user)
 
     logger.info("新用户注册成功：%s", email)
-
-    token, expires_in = create_access_token(user.id)
-    return TokenResponse(token=token, token_type="bearer", expires_in=expires_in, user=user_out(user))
+    return _token_response(user, is_new_user=True)
 
 
 @router.post("/login", response_model=TokenResponse, summary="邮箱密码登录")
@@ -199,10 +244,102 @@ async def login(
     if not user.is_active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "账号已被禁用")
 
-    token, expires_in = create_access_token(user.id)
-    return TokenResponse(token=token, token_type="bearer", expires_in=expires_in, user=user_out(user))
+    return _token_response(user)
+
+
+@router.post(
+    "/login-code",
+    response_model=TokenResponse,
+    summary="邮箱验证码登录（未注册的邮箱自动注册）",
+)
+async def login_with_code(
+    payload: CodeLoginRequest,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
+    email = _normalize_email(payload.email)
+    await _consume_code(db, email, PURPOSE_LOGIN, payload.code)
+
+    user = await db.scalar(select(User).where(User.email == email))
+    is_new_user = False
+
+    if user is None:
+        user = User(
+            email=email,
+            # 昵称留空时使用邮箱
+            nickname=_default_nickname(payload.nickname, email),
+            hashed_password=hash_password(secrets.token_urlsafe(_UNUSABLE_PASSWORD_BYTES)),
+            is_active=True,
+        )
+        db.add(user)
+        is_new_user = True
+
+    if not user.is_active:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "账号已被禁用")
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:  # 并发下同一邮箱被同时创建
+        await db.rollback()
+        user = await db.scalar(select(User).where(User.email == email))
+        if user is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "账号创建冲突，请重试"
+            ) from exc
+        is_new_user = False
+
+    await db.refresh(user)
+
+    if is_new_user:
+        logger.info("验证码登录自动注册：%s（昵称：%s）", email, user.nickname)
+    else:
+        logger.info("验证码登录：%s", email)
+
+    return _token_response(user, is_new_user=is_new_user)
+
+
+@router.post(
+    "/reset-password",
+    response_model=TokenResponse,
+    summary="找回密码（验证码校验后重置，旧令牌全部失效）",
+)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
+    email = _normalize_email(payload.email)
+    user = await db.scalar(select(User).where(User.email == email))
+
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "该邮箱尚未注册，请先注册")
+    if not user.is_active:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "账号已被禁用")
+
+    await _consume_code(db, email, PURPOSE_RESET, payload.code)
+
+    user.hashed_password = hash_password(payload.password)
+    user.token_version += 1
+    await db.commit()
+    await db.refresh(user)
+
+    logger.info("密码已重置：%s", email)
+    return _token_response(user)
 
 
 @router.get("/me", response_model=UserOut, summary="当前登录用户")
 async def me(user: User = Depends(get_current_user)) -> UserOut:
+    return user_out(user)
+
+
+@router.patch("/me", response_model=UserOut, summary="更新当前用户昵称")
+async def update_me(
+    payload: UpdateProfileRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserOut:
+    """设置昵称；昵称留空时回退为邮箱（需求：不填就用邮箱）。"""
+    user.nickname = _default_nickname(payload.nickname, user.email)
+    await db.commit()
+    await db.refresh(user)
+
+    logger.info("昵称已更新：%s -> %s", user.email, user.nickname)
     return user_out(user)

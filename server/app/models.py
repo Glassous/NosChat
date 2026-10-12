@@ -38,6 +38,8 @@ class User(Base):
     nickname: Mapped[str] = mapped_column(String(64), nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="true")
+    # 令牌版本：重置密码时 +1，使此前签发的所有访问令牌立即失效
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

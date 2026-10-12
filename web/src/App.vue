@@ -29,7 +29,11 @@
             {{ getAvatarInitial(currentUser?.nickname || currentUser?.username) }}
           </div>
           <div class="user-details">
-            <span class="user-nickname">{{ currentUser?.nickname || currentUser?.username }}</span>
+            <span
+              class="user-nickname"
+              title="点击修改昵称"
+              @click="openNicknameDialog"
+            >{{ currentUser?.nickname || currentUser?.username }}</span>
             <button @click="handleLogout" class="logout-btn" title="退出登录">
               退出
             </button>
@@ -129,9 +133,41 @@
     </main>
 
     <footer class="app-footer">
-      <p>© 2024 NosChat - AI 智能聊天助手</p>
+      <p>© 2026 NosChat - AI 智能聊天助手</p>
       <p class="disclaimer">用户：{{ currentUser?.username }} | 昵称：{{ currentUser?.nickname }}</p>
     </footer>
+
+    <!-- 昵称设置弹窗（验证码登录自动注册后弹出，也可点击顶部昵称打开） -->
+    <Transition name="modal">
+      <div v-if="nicknameDialog" class="modal-backdrop" @click.self="skipNickname">
+        <div class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="nick-title">
+          <div class="confirm-icon">👋</div>
+          <h2 id="nick-title">设置你的昵称</h2>
+          <p class="confirm-text">
+            账号已创建，填一个昵称方便识别；留空将使用邮箱作为昵称。
+          </p>
+          <input
+            ref="nicknameInputRef"
+            v-model.trim="nicknameInput"
+            class="nickname-field"
+            type="text"
+            maxlength="32"
+            placeholder="请输入昵称（可选）"
+            aria-label="昵称"
+            :disabled="nicknameSaving"
+            @keydown.enter.prevent="saveNickname"
+          />
+          <div class="confirm-actions">
+            <button class="btn ghost" @click="skipNickname" :disabled="nicknameSaving">
+              用邮箱当昵称
+            </button>
+            <button class="btn primary" @click="saveNickname" :disabled="nicknameSaving">
+              {{ nicknameSaving ? '保存中...' : '保存昵称' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
 
     <!-- 删除确认弹窗 -->
     <Transition name="modal">
@@ -158,7 +194,7 @@
 </template>
 
 <script setup>
-import { ref, computed, reactive, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, reactive, nextTick, onMounted, onBeforeUnmount, watch } from 'vue'
 import ChatSidebar from './components/ChatSidebar.vue'
 import ChatMessages from './components/ChatMessages.vue'
 import ChatInput from './components/ChatInput.vue'
@@ -178,7 +214,15 @@ import {
 import { fmtClock, fmtRelative, nowClock } from './utils/time.js'
 
 // 用户认证状态
-const { isAuthenticated, currentUser, logout: authLogout } = useAuth()
+const {
+  isAuthenticated,
+  currentUser,
+  logout: authLogout,
+  lastAuthIsNew,
+  needsNicknamePrompt,
+  saveNickname: saveNicknameApi,
+  clearNicknamePrompt
+} = useAuth()
 
 // 聊天应用状态
 const conversations = ref([])
@@ -191,6 +235,12 @@ const sidebarOpen = ref(false)
 const pendingDelete = ref(null)
 const toast = ref('')
 const selectedModelId = ref(localStorage.getItem('noschat.model') || '')
+
+// 昵称设置弹窗（验证码登录自动注册后弹出，也支持手动打开）
+const nicknameDialog = ref(false)
+const nicknameInput = ref('')
+const nicknameSaving = ref(false)
+const nicknameInputRef = ref(null)
 
 // 深度思考区块的默认展开状态
 const thinkDefaultOpen = ref(localStorage.getItem('noschat.thinkOpen') === '1')
@@ -506,8 +556,39 @@ function onModelChange(model) {
 }
 
 function handleAuthSuccess() {
-  showToast('登录成功！')
+  showToast(lastAuthIsNew.value ? '账号已创建并登录！' : '登录成功！')
   bootstrap()
+}
+
+// ---------------- 昵称设置 ----------------
+
+function openNicknameDialog() {
+  const current = currentUser.value?.nickname || ''
+  // 昵称仍是邮箱时视为未设置，清空以便直接输入
+  nicknameInput.value = current === currentUser.value?.email ? '' : current
+  nicknameDialog.value = true
+  nextTick(() => nicknameInputRef.value?.focus())
+}
+
+function skipNickname() {
+  nicknameDialog.value = false
+  clearNicknamePrompt()
+  showToast('已使用邮箱作为昵称')
+}
+
+async function saveNickname() {
+  if (nicknameSaving.value) return
+  nicknameSaving.value = true
+  try {
+    const user = await saveNicknameApi(nicknameInput.value)
+    nicknameDialog.value = false
+    clearNicknamePrompt()
+    showToast(`昵称已更新为 ${user?.nickname || '邮箱'}`)
+  } catch (error) {
+    showToast(error?.message || '昵称保存失败')
+  } finally {
+    nicknameSaving.value = false
+  }
 }
 
 function handleLogout() {
@@ -531,6 +612,11 @@ watch(activeConversationId, () => {
 // 登录成功后加载模型清单与历史会话
 watch(isAuthenticated, value => {
   if (value) bootstrap()
+})
+
+// 验证码登录自动注册后，提示设置昵称
+watch(needsNicknamePrompt, value => {
+  if (value && !nicknameDialog.value) openNicknameDialog()
 })
 
 // 响应式：>900px 内联侧栏，<=900px 收进抽屉
@@ -620,6 +706,13 @@ onBeforeUnmount(() => {
   max-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
+  border-bottom: 1px dashed transparent;
+  transition: border-color 0.2s ease;
+}
+
+.user-nickname:hover {
+  border-bottom-color: rgba(255, 255, 255, 0.6);
 }
 
 .logout-btn {
@@ -1030,6 +1123,40 @@ onBeforeUnmount(() => {
 .btn.danger:hover {
   transform: translateY(-1px);
   box-shadow: 0 6px 18px rgba(239, 68, 68, 0.4);
+}
+
+.btn.primary {
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: #fff;
+}
+
+.btn.primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(102, 126, 234, 0.4);
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 昵称设置弹窗的输入框 */
+.nickname-field {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.7rem;
+  font-size: 0.9rem;
+  color: #1e293b;
+  background: #fff;
+  margin-bottom: 1.25rem;
+  transition: all 0.2s ease;
+}
+
+.nickname-field:focus {
+  outline: none;
+  border-color: #667eea;
+  box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
 }
 
 .modal-enter-active,
