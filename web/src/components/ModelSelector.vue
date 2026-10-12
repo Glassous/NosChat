@@ -96,7 +96,7 @@
 
 <script setup>
 import { ref, computed, watch, onBeforeUnmount } from 'vue'
-import { relRelease, sortModels } from '../data/models.js'
+import { FALLBACK_MODEL, relRelease, sortModels } from '../data/models.js'
 
 const props = defineProps({
   models: { type: Array, required: true },
@@ -124,7 +124,10 @@ const sortHint = computed(() => {
 })
 
 const current = computed(
-  () => props.models.find(m => m.id === props.modelValue) || props.models[0]
+  () =>
+    props.models.find(m => m.id === props.modelValue) ||
+    props.models[0] ||
+    FALLBACK_MODEL
 )
 
 /** 发布日期（ISO）→ 可比较的时间戳；缺失或非法排到最后 */

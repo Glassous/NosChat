@@ -1,168 +1,110 @@
-import { reactive, computed } from 'vue'
+/**
+ * 用户状态管理：对接后端 /api/auth（邮箱验证码注册 + 邮箱密码登录）。
+ * 对外暴露的字段与函数签名保持与原实现一致，便于界面层零改动复用。
+ */
 
-// 模拟用户存储
-const KEY_USER = 'noschat.user'
-const KEY_TOKEN = 'noschat.token'
+import { computed, reactive } from 'vue'
 
-// 用户状态管理
+import * as authApi from '../api/auth.js'
+import {
+  clearAuthStorage,
+  getToken,
+  loadUser,
+  saveToken,
+  saveUser,
+  UNAUTHORIZED_EVENT
+} from '../api/client.js'
+
 const state = reactive({
-  user: null,
-  token: null,
-  isLoading: false
+  user: loadUser(),
+  token: getToken() || null,
+  isLoading: false,
+  initialized: false
 })
 
-// 从本地存储初始化
-try {
-  const savedUser = localStorage.getItem(KEY_USER)
-  const savedToken = localStorage.getItem(KEY_TOKEN)
-  
-  if (savedUser && savedToken) {
-    state.user = JSON.parse(savedUser)
-    state.token = savedToken
-  }
-} catch (e) {
-  console.warn('Failed to load user from localStorage', e)
+/** 令牌失效（后端返回 401）时同步清理本地状态 */
+window.addEventListener(UNAUTHORIZED_EVENT, () => {
+  state.user = null
+  state.token = null
+  state.initialized = false
+})
+
+function applySession({ token, user }) {
+  state.token = token
+  state.user = user
+  state.initialized = true
+  saveToken(token)
+  saveUser(user)
+  return user
 }
 
 export function useAuth() {
-  // 计算属性
-  const isAuthenticated = computed(() => !!state.user && !!state.token)
+  const isAuthenticated = computed(() => Boolean(state.user && state.token))
   const currentUser = computed(() => state.user)
   const authToken = computed(() => state.token)
   const authLoading = computed(() => state.isLoading)
 
-  // 注册函数
-  async function register({ username, nickname, password }) {
+  /** 发送注册验证码 */
+  async function sendCode({ email }) {
+    return authApi.sendCode(email)
+  }
+
+  /** 注册（成功后自动登录） */
+  async function register({ email, code, nickname, password }) {
     if (state.isLoading) return null
-    
     state.isLoading = true
     try {
-      // 模拟API调用延迟
-      await new Promise(resolve => setTimeout(resolve, 500))
-      
-      // 简单验证
-      if (!username || !nickname || !password) {
-        throw new Error('请填写所有必填字段')
-      }
-      
-      if (username.length < 3) {
-        throw new Error('用户名至少需要3个字符')
-      }
-      
-      if (password.length < 6) {
-        throw new Error('密码至少需要6个字符')
-      }
-      
-      // 模拟检查用户名是否已存在
-      const existingUsersStr = localStorage.getItem('noschat.users') || '[]'
-      const existingUsers = JSON.parse(existingUsersStr)
-      const userExists = existingUsers.some(u => u.username === username)
-      
-      if (userExists) {
-        throw new Error('用户名已被使用')
-      }
-      
-      // 创建新用户
-      const newUser = {
-        id: Date.now().toString(),
-        username,
-        nickname,
-        createdAt: new Date().toISOString()
-      }
-      
-      // 保存到用户列表
-      existingUsers.push(newUser)
-      localStorage.setItem('noschat.users', JSON.stringify(existingUsers))
-      
-      // 自动登录
-      const token = `token_${Date.now()}_${Math.random().toString(36).substr(2)}`
-      
-      state.user = newUser
-      state.token = token
-      
-      // 保存到本地存储
-      localStorage.setItem(KEY_USER, JSON.stringify(newUser))
-      localStorage.setItem(KEY_TOKEN, token)
-      
-      return { user: newUser, token }
-    } catch (error) {
-      throw error
+      const data = await authApi.register({ email, code, nickname, password })
+      applySession(data)
+      return data
     } finally {
       state.isLoading = false
     }
   }
 
-  // 登录函数
-  async function login({ username, password }) {
+  /** 登录 */
+  async function login({ email, password }) {
     if (state.isLoading) return null
-    
     state.isLoading = true
     try {
-      // 模拟API调用延迟
-      await new Promise(resolve => setTimeout(resolve, 500))
-      
-      // 简单验证
-      if (!username || !password) {
-        throw new Error('请填写用户名和密码')
-      }
-      
-      // 模拟验证逻辑
-      const usersStr = localStorage.getItem('noschat.users') || '[]'
-      const users = JSON.parse(usersStr)
-      const user = users.find(u => u.username === username)
-      
-      if (!user) {
-        throw new Error('用户名或密码错误')
-      }
-      
-      // 模拟密码验证 (在实际应用中应该使用bcrypt等)
-      const isValid = password === '123456' // 简单演示，统一使用默认密码
-      if (!isValid) {
-        throw new Error('用户名或密码错误')
-      }
-      
-      const token = `token_${Date.now()}_${Math.random().toString(36).substr(2)}`
-      
+      const data = await authApi.login({ email, password })
+      applySession(data)
+      return data
+    } finally {
+      state.isLoading = false
+    }
+  }
+
+  /** 拉取当前用户（令牌存在时可校验登录态） */
+  async function fetchMe() {
+    if (!state.token) return null
+    try {
+      const user = await authApi.fetchMe()
       state.user = user
-      state.token = token
-      
-      // 保存到本地存储
-      localStorage.setItem(KEY_USER, JSON.stringify(user))
-      localStorage.setItem(KEY_TOKEN, token)
-      
-      return { user, token }
+      state.initialized = true
+      saveUser(user)
+      return user
     } catch (error) {
-      throw error
-    } finally {
-      state.isLoading = false
+      // 401 已由客户端统一清理；其它错误保留现状
+      if (error?.status === 401) logout()
+      return null
     }
   }
 
-  // 退出登录
+  /** 退出登录 */
   function logout() {
     state.user = null
     state.token = null
-    localStorage.removeItem(KEY_USER)
-    localStorage.removeItem(KEY_TOKEN)
+    state.initialized = false
+    clearAuthStorage()
   }
 
-  // 更新用户信息
+  /** 本地更新用户信息（后端暂无资料修改接口） */
   function updateUser(updates) {
-    if (!state.user) return
-    
+    if (!state.user) return null
     const updatedUser = { ...state.user, ...updates }
-    const usersStr = localStorage.getItem('noschat.users') || '[]'
-    const users = JSON.parse(usersStr)
-    const userIndex = users.findIndex(u => u.id === state.user.id)
-    
-    if (userIndex !== -1) {
-      users[userIndex] = updatedUser
-      localStorage.setItem('noschat.users', JSON.stringify(users))
-    }
-    
     state.user = updatedUser
-    localStorage.setItem(KEY_USER, JSON.stringify(updatedUser))
-    
+    saveUser(updatedUser)
     return updatedUser
   }
 
@@ -172,11 +114,18 @@ export function useAuth() {
     currentUser,
     authToken,
     authLoading,
-    
+
     // 方法
+    sendCode,
     register,
     login,
+    fetchMe,
     logout,
     updateUser
   }
+}
+
+// 已有令牌但本地缺少用户信息时，后台补拉一次
+if (state.token && !state.user) {
+  void useAuth().fetchMe()
 }

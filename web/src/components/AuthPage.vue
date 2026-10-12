@@ -43,19 +43,19 @@
             novalidate
           >
             <div class="form-group">
-              <label for="login-username">
-                <span class="icon">👤</span>
-                <span>用户名</span>
+              <label for="login-email">
+                <span class="icon">📧</span>
+                <span>邮箱</span>
               </label>
               <div class="input-wrapper">
                 <input
-                  id="login-username"
-                  v-model="loginForm.username"
-                  type="text"
-                  placeholder="请输入用户名"
+                  id="login-email"
+                  v-model="loginForm.email"
+                  type="email"
+                  placeholder="请输入注册邮箱"
                   :disabled="authLoading"
                   required
-                  autocomplete="username"
+                  autocomplete="email"
                 />
                 <span class="input-icon">@</span>
               </div>
@@ -86,7 +86,7 @@
                 </button>
               </div>
               <p class="form-hint">
-                演示账号：用户名任意，密码固定为 123456
+                使用注册邮箱与密码登录
               </p>
             </div>
 
@@ -94,7 +94,7 @@
               <button 
                 type="submit" 
                 class="auth-btn primary"
-                :disabled="authLoading || !loginForm.username || !loginForm.password"
+                :disabled="authLoading || !loginForm.email || !loginForm.password"
                 :aria-busy="authLoading"
               >
                 <span v-if="!authLoading">登录</span>
@@ -118,26 +118,55 @@
             novalidate
           >
             <div class="form-group">
-              <label for="register-username">
-                <span class="icon">👤</span>
-                <span>用户名 *</span>
+              <label for="register-email">
+                <span class="icon">📧</span>
+                <span>邮箱 *</span>
               </label>
               <div class="input-wrapper">
                 <input
-                  id="register-username"
-                  v-model="registerForm.username"
-                  type="text"
-                  placeholder="请输入用户名（至少3位字符）"
+                  id="register-email"
+                  v-model="registerForm.email"
+                  type="email"
+                  placeholder="请输入邮箱，用于接收验证码"
                   :disabled="authLoading"
                   required
-                  autocomplete="username"
-                  minlength="3"
+                  autocomplete="email"
                 />
                 <span class="input-icon">@</span>
               </div>
-              <p v-if="mode === 'register' && registerForm.username" class="form-hint">
-                {{ registerForm.username.length < 3 ? '用户名太短' : '格式正确' }}
+              <p v-if="mode === 'register' && registerForm.email" class="form-hint">
+                {{ isEmailValid(registerForm.email) ? '格式正确' : '邮箱格式不正确' }}
               </p>
+            </div>
+
+            <div class="form-group">
+              <label for="register-code">
+                <span class="icon">🔑</span>
+                <span>邮箱验证码 *</span>
+              </label>
+              <div class="input-wrapper has-code">
+                <input
+                  id="register-code"
+                  v-model.trim="registerForm.code"
+                  type="text"
+                  inputmode="numeric"
+                  placeholder="请输入邮件中的验证码"
+                  :disabled="authLoading"
+                  required
+                  autocomplete="one-time-code"
+                  maxlength="8"
+                />
+                <button
+                  type="button"
+                  class="code-btn"
+                  :disabled="authLoading || codeSending || countdown > 0"
+                  @click="handleSendCode"
+                >
+                  {{ countdown > 0 ? `${countdown}s 后重发` : (codeSending ? '发送中…' : '获取验证码') }}
+                </button>
+              </div>
+              <p v-if="devCode" class="form-hint">开发模式验证码：{{ devCode }}</p>
+              <p v-else-if="codeSent" class="form-hint">验证码已发送，请查收邮箱</p>
             </div>
 
             <div class="form-group">
@@ -256,23 +285,31 @@
 </template>
 
 <script setup>
-import { ref, computed, reactive } from 'vue'
+import { ref, computed, reactive, onBeforeUnmount } from 'vue'
 import { useAuth } from '../stores/userStore.js'
 
-const { login: loginApi, register: registerApi, authLoading } = useAuth()
+const {
+  login: loginApi,
+  register: registerApi,
+  sendCode: sendCodeApi,
+  authLoading
+} = useAuth()
+
+const emit = defineEmits(['success'])
 
 // 模式切换：login 或 register
 const mode = ref('login')
 
 // 登录表单
 const loginForm = reactive({
-  username: '',
+  email: '',
   password: ''
 })
 
 // 注册表单
 const registerForm = reactive({
-  username: '',
+  email: '',
+  code: '',
   nickname: '',
   password: '',
   confirmPassword: ''
@@ -285,12 +322,37 @@ const showRegisterPassword = ref(false)
 // 错误信息
 const error = ref('')
 
+// 验证码发送状态
+const codeSending = ref(false)
+const countdown = ref(0)
+const devCode = ref('')
+const codeSent = ref(false)
+let countdownTimer = null
+
+function isEmailValid(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((value || '').trim())
+}
+
+function startCountdown(seconds) {
+  if (countdownTimer) clearInterval(countdownTimer)
+  countdown.value = Math.max(1, Number(seconds) || 60)
+  countdownTimer = setInterval(() => {
+    countdown.value -= 1
+    if (countdown.value <= 0) {
+      clearInterval(countdownTimer)
+      countdownTimer = null
+      countdown.value = 0
+    }
+  }, 1000)
+}
+
 // 注册表单验证
 const isRegisterFormValid = computed(() => {
   const form = registerForm
   return (
-    form.username &&
-    form.username.length >= 3 &&
+    isEmailValid(form.email) &&
+    form.code &&
+    form.code.length >= 4 &&
     form.nickname &&
     form.password &&
     form.password.length >= 6 &&
@@ -299,13 +361,38 @@ const isRegisterFormValid = computed(() => {
   )
 })
 
+// 发送邮箱验证码
+async function handleSendCode() {
+  error.value = ''
+
+  if (!isEmailValid(registerForm.email)) {
+    error.value = '请输入正确的邮箱地址'
+    return
+  }
+
+  codeSending.value = true
+  try {
+    const result = await sendCodeApi({ email: registerForm.email.trim() })
+    devCode.value = result?.devCode || ''
+    codeSent.value = !result?.devCode
+    // 开发模式（未配置 SMTP）下直接回填，便于自测
+    if (result?.devCode) registerForm.code = result.devCode
+    startCountdown(result?.resendAfter || 60)
+  } catch (err) {
+    console.error('Send code failed:', err)
+    error.value = err.message || '验证码发送失败，请稍后重试'
+  } finally {
+    codeSending.value = false
+  }
+}
+
 // 处理登录
 async function handleLogin() {
   error.value = ''
   
   try {
     await loginApi({
-      username: loginForm.username.trim(),
+      email: loginForm.email.trim(),
       password: loginForm.password
     })
     
@@ -328,7 +415,8 @@ async function handleRegister() {
     }
     
     await registerApi({
-      username: registerForm.username.trim(),
+      email: registerForm.email.trim(),
+      code: registerForm.code.trim(),
       nickname: registerForm.nickname.trim(),
       password: registerForm.password
     })
@@ -342,7 +430,12 @@ async function handleRegister() {
   }
 }
 
-const emit = defineEmits(['success'])
+onBeforeUnmount(() => {
+  if (countdownTimer) {
+    clearInterval(countdownTimer)
+    countdownTimer = null
+  }
+})
 </script>
 
 <style scoped>
@@ -544,6 +637,36 @@ const emit = defineEmits(['success'])
 
 .toggle-password:hover {
   color: #64748b;
+}
+
+/* 邮箱验证码：输入框右侧按钮，沿用现有输入框配色与圆角风格 */
+.input-wrapper.has-code input {
+  padding-right: 6.75rem;
+}
+
+.code-btn {
+  position: absolute;
+  right: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: #667eea;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0.25rem;
+  white-space: nowrap;
+}
+
+.code-btn:hover:not(:disabled) {
+  color: #4f46e5;
+}
+
+.code-btn:disabled {
+  color: #94a3b8;
+  cursor: not-allowed;
 }
 
 .form-hint {

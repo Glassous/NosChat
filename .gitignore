@@ -101,3 +101,11 @@ web/dist/
 
 # 沙箱文件权限修复的备份与恢复记录
 .dsh-acl-recovery/
+
+# Python backend
+server/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

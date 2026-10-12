@@ -1,214 +1,253 @@
-# NosChat - AI 聊天应用前端
+# NosChat - AI 聊天应用（全栈版）
 
-这是一个基于 Vite + Vue 3 的 AI 聊天应用前端演示。应用展示了完整的聊天界面和交互逻辑，暂未集成实际 AI 能力。
+Vue 3 前端 + FastAPI 后端 + PostgreSQL 的 AI 聊天应用：真实的 OpenAI 兼容模型调用、SSE 流式输出、邮箱验证码注册登录、按用户持久化会话与消息，并提供容器化部署（容器只包含后端与数据库，**不含前端**）。
+
+> 前端界面布局、配色与交互保持不变，本次改动集中在**数据/API 层**，并按需为认证表单补充「邮箱 / 验证码」输入项。
 
 ## 功能特性
 
-- 🎨 **现代化聊天界面**：采用渐变背景、毛玻璃效果和流畅动画
-- 💬 **多对话管理**：支持查看历史对话、创建新对话
-- 🧠 **深度思考展示**：推理模型先输出思考链，可逐条展开/折叠，思考与回答均为流式打字效果
-- 🧩 **多模型切换**：模型列表带厂商、上下文、能力条与**发布日期**，支持按发布时间排序与搜索
-- 📱 **响应式设计**：适配桌面端和移动端
-- ⌨️ **智能输入框**：支持快捷键、自动调整高度、快捷回复建议
-- ⚡ **实时交互反馈**：打字状态指示、发送动画、消息动画
-- 🎯 **离线演示模式**：包含完整的模拟数据，无需后端即可运行
+### 前端
+- 🎨 **现代化聊天界面**：渐变背景、毛玻璃效果与流畅动画（保持原有设计）
+- 💬 **多对话管理**：会话列表来自后端并持久化，支持新建、重命名、删除
+- 🧠 **深度思考展示**：推理模型先输出思考链，可逐条展开/折叠（由后端真实 `reasoning` 增量驱动）
+- 🧩 **多模型切换**：模型清单由后端下发，含厂商、上下文、能力条、**介绍**与**发布日期**，支持按发布时间排序与搜索
+- 🔐 **登录 / 注册**：邮箱 + 密码登录，注册需邮箱验证码
+- 📱 **响应式设计**：桌面端内联侧栏、窄屏抽屉（原样保留）
+
+### 后端
+- 🚀 **FastAPI**（默认 `9135` 端口）+ PostgreSQL（SQLAlchemy 2.x 异步 + psycopg3）
+- 🤖 **真实模型调用**：一个 `OPENAI_BASE_URL` + 一个 `OPENAI_API_KEY` + 多个 model（OpenAI 标准接口）
+- 🌊 **SSE 流式转发**：思考内容与正式回答分别流式下发，前端逐字渲染
+- ✉️ **SMTP 邮件验证码**：注册前校验邮箱验证码（哈希存储、有效期、重发限流、错误次数限制）
+- 🔑 **密码与令牌**：bcrypt 密码哈希 + JWT 访问令牌
+- 🗂️ **会话与消息持久化**：按用户隔离，自动生成标题与预览
+- ⚙️ **环境变量驱动**：数据库、密钥、邮件、模型、CORS 等全部可配置
+- 🐳 **容器化部署**：`docker compose` 一键起后端 + PostgreSQL（不含前端）
+
+## 架构
+
+```
+┌────────────────────┐   /api/models        ┌──────────────────────────┐
+│  Vue 3 前端 (web/) │   /api/auth/*        │  FastAPI 后端 (server/)  │
+│  仅数据/API 层改造 │ ───────────────────► │  9135                    │
+│  Vite dev: 3000    │   /api/conversations │                          │
+│                    │ ◄══ SSE 流式 ◄══════ │  ┌────────────────────┐  │
+└────────────────────┘   /api/chat/stream   │  │ OpenAI 兼容接口    │  │
+                                            │  │ base_url + key     │  │
+                                            │  └────────────────────┘  │
+                                            │  ┌────────────────────┐  │
+                                            │  │ SMTP 邮件服务      │  │
+                                            │  └────────────────────┘  │
+                                            └───────────┬──────────────┘
+                                                        │
+                                              ┌─────────▼─────────┐
+                                              │   PostgreSQL 16   │
+                                              │  用户/验证码/会话 │
+                                              │  /消息            │
+                                              └───────────────────┘
+```
 
 ## 项目结构
 
 ```
 NosChat/
-├── web/                          # Vue 前端应用
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── ChatSidebar.vue      # 侧边栏对话列表
-│   │   │   ├── ChatMessages.vue     # 消息展示区域（含深度思考折叠面板）
-│   │   │   ├── ChatInput.vue        # 消息输入组件
-│   │   │   └── ModelSelector.vue    # 模型下拉：搜索、排序、发布日期
-│   │   ├── data/
-│   │   │   └── models.js            # 模型清单、模拟对话与回复生成
-│   │   ├── App.vue                  # 主应用组件
-│   │   ├── main.js                  # 应用入口
-│   │   └── style.css                # 全局样式
-│   ├── index.html                   # HTML 模板
-│   ├── vite.config.js               # Vite 配置
-│   ├── package.json                 # 项目依赖
-│   ├── vite.svg                     # 应用图标
-│   ├── test-server.js               # 启动测试脚本
-│   └── .sfc-check.cjs               # 不启动 Vite 的 SFC 编译自检
-├── README.md                        # 项目说明
-└── .gitignore                       # Git 忽略配置文件
+├── server/                                   # 后端（容器内运行）
+│   ├── app/
+│   │   ├── main.py                           # 应用入口：CORS、路由挂载、启动建表、/health
+│   │   ├── config.py                         # 环境变量（pydantic-settings）
+│   │   ├── database.py                       # 异步 engine / session / 建表
+│   │   ├── models.py                         # ORM：User / EmailVerification / Conversation / Message
+│   │   ├── schemas.py                        # 请求响应模型（对外 camelCase）
+│   │   ├── security.py                       # bcrypt 密码哈希、JWT、验证码哈希
+│   │   ├── deps.py                           # get_db / get_current_user
+│   │   ├── mailer.py                         # aiosmtplib 发送验证码邮件
+│   │   ├── llm.py                            # AsyncOpenAI 流式调用（含友好错误映射）
+│   │   ├── model_registry.py                 # 模型清单加载与兜底
+│   │   └── routers/{auth,catalog,chat}.py    # 认证 / 模型清单 / 会话与流式对话
+│   ├── config/models.json                    # 模型清单（介绍、发布日期、标签等）
+│   ├── tests/{smoke_api.py,mock_llm.py}      # 接口冒烟测试、本地 Mock 模型服务
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   ├── .env.example
+│   └── run.py                                # 启动入口（Windows 事件循环兼容）
+├── web/                                      # 前端（不进入容器）
+│   └── src/
+│       ├── api/{client,auth,chat}.js         # 新增：接口客户端、认证、模型/会话/SSE
+│       ├── utils/time.js                     # 新增：时间展示格式化
+│       ├── stores/userStore.js               # 改造：对接后端鉴权（保留原暴露字段）
+│       ├── data/models.js                    # 改造：模型清单运行时注册表
+│       ├── components/AuthPage.vue           # 增补：邮箱 + 验证码输入项
+│       ├── components/ModelSelector.vue      # 微调：清单为空时的兜底，避免渲染报错
+│       ├── App.vue                           # 改造：真实模型清单 / SSE / 会话持久化（模板不变）
+│       └── ...                               # 其余组件未改动
+├── docker-compose.yml                        # 后端 + PostgreSQL（不含前端）
+├── .env.example                              # compose 环境变量样例
+└── check-project-structure.js                # 项目结构自检
 ```
-
-## 技术栈
-
-- **框架**：Vue 3 (Composition API)
-- **构建工具**：Vite 5
-- **样式**：原生 CSS + CSS 变量
-- **交互**：Vue 响应式系统
-- **设计**：现代化 UI 设计，无 UI 库依赖
-- **流式打字**：按固定间隔逐步填充文本，模拟先思考后回答的过程
-
-## 新增功能（2026‑10‑12）
-
-| 功能 | 实现位置 | 说明 |
-| --- | --- | --- |
-| 🧠 **深度思考展开/折叠** | `ChatMessages.vue` | 推理模型的回复顶部添加可展开面板，显示思考链；可逐条折叠、默认开关 |
-| 📅 **发布日期字段** | `data/models.js` & `ModelSelector.vue` | 每个模型新增 `released: 'YYYY-MM-DD'`，在工具栏、模型列表及标签中显示 |
-| 🔍 **按发布日期排序** | `ModelSelector.vue` | 模型下拉新增排序条：推荐顺序 / 最新发布 / 最早发布 |
-| ⏱️ **流式生成模拟** | `App.vue` & `ChatMessages.vue` | 有思考内容的模型先逐字输出思考链（约 60% 时间），再逐字输出答案 |
-| ⚙️ **深度思考默认设置** | 工具栏 🧠 开关 | 开关保持用户设置 `localStorage.noschat.thinkOpen`，逐条点击覆盖只影响该条 |
-| 📱 **响应式优化** | 各组件媒体查询 | 窄屏隐藏次要信息，模型下拉适配抽屉形态，思考条简化移动端 |
-
-## 部署与演示
-
-1. **本地开发**：
-   ```bash
-   cd web ; npm install ; npm run dev        # http://localhost:3000
-   ```
-2. **功能验证**：
-   - 选择「Claude 3.7 Sonnet」等推理模型并发送消息，观察🧠折叠面板与流式打字
-   - 打开模型下拉切换「最新发布」排序，查看右侧发布日期列
-   - 在工具栏中切换🧠开关，看深度思考区块是否默认折叠/展开
-   - 检查移动端窄屏时次要信息（如「发布于…」角标、思考开关文字）是否自动隐藏
 
 ## 快速开始
 
-### 前端开发
-1. **进入前端目录**
-   ```bash
-   cd web
-   ```
+### 方式一：容器化（后端 + PostgreSQL）
 
-2. **安装依赖**
-   ```bash
-   npm install
-   ```
+```bash
+# 1) 准备环境变量（Windows PowerShell：Copy-Item .env.example .env）
+cp .env.example .env
+# 必填：JWT_SECRET、OPENAI_API_KEY、OPENAI_BASE_URL、SMTP_*
 
-3. **开发模式**
-   ```bash
-   npm run dev
-   ```
-   应用将在 http://localhost:3000 启动
+# 2) 构建并启动
+docker compose up -d --build
 
-4. **构建生产版本**
-   ```bash
-   npm run build
-   ```
+# 3) 健康检查
+curl http://localhost:9135/health
+# {"status":"ok","version":"1.0.0","models":9}
 
-5. **预览构建结果**
-   ```bash
-   npm run preview
-   ```
+# 4) 前端仍单独运行（容器不含前端）
+cd web && npm install && npm run dev     # http://localhost:3000
+```
 
-## 核心组件说明
+### 方式二：本地开发
 
-### ChatSidebar.vue
-- 显示历史对话列表
-- 支持新建对话
-- 显示对话预览和未读状态
-- 状态指示器
+```bash
+# 后端
+cd server
+python -m venv .venv
+.venv/Scripts/pip install -r requirements.txt     # Linux/macOS: .venv/bin/pip
+cp .env.example .env                              # 填写 DATABASE_URL / OPENAI_* / SMTP_*
+python run.py                                     # http://localhost:9135
 
-### ChatMessages.vue
-- 显示对话消息记录
-- 区分 AI 和用户消息
-- **深度思考折叠面板**：`thinking` 非空时渲染「🧠 深度思考 · 已思考 N 秒」条，点击展开/折叠，展开有高度过渡
-- 思考进行中自动展开并显示计时与光标，开始输出结论后按默认状态折叠
-- 打字状态指示、空状态和快捷建议
+# 前端（另开终端）
+cd web
+npm install
+npm run dev                                       # http://localhost:3000
+```
 
-### ModelSelector.vue
-- 模型下拉面板：搜索（名称/厂商/标签/发布日期）、当前选中态、能力条
-- **发布日期**：每行右侧显示 `released`（如 `2025-01-20`），标签行补充相对时间（如「8 个月前发布」）
-- 排序切换：推荐顺序 / 最新发布 / 最早发布
+> **Windows 提示**：请使用 `python run.py` 启动后端。psycopg 的异步模式不支持 Windows 默认的 `ProactorEventLoop`，`run.py` 会自动切换到 `SelectorEventLoop`；直接执行 `python -m uvicorn app.main:app` 会报 `Psycopg cannot use the 'ProactorEventLoop'`。
 
-### ChatInput.vue
-- 智能消息输入框（自适应高度）
-- 快捷键支持（Enter 发送，Shift+Enter 换行）
-- 快捷操作按钮
-- 字符计数和验证
-- 模型信息条：显示发布日期、是否包含深度思考、模拟响应耗时
+### 接口冒烟测试
 
-## 模型数据字段（`web/src/data/models.js`）
+```bash
+cd server
+python tests/smoke_api.py            # 覆盖注册/登录/模型/会话/SSE/错误路径
+```
+
+本地没有真实模型服务时，可用自带 Mock：
+
+```bash
+cd server
+python tests/mock_llm.py             # 127.0.0.1:9901
+# server/.env 中设置 OPENAI_BASE_URL=http://127.0.0.1:9901/v1
+```
+
+## 环境变量
+
+### 后端（`server/.env`）与容器编排（根目录 `.env`）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORT` | `9135` | 后端监听端口 |
+| `DEBUG` | `false` | 调试日志 |
+| `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | 允许的前端来源，逗号分隔 |
+| `DATABASE_URL` | `postgresql+psycopg://noschat:noschat@localhost:5432/noschat` | PostgreSQL 连接串（compose 内为 `@db:5432`） |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容接口地址（**一个**） |
+| `OPENAI_API_KEY` | 空 | 接口密钥（**一个**，必填） |
+| `OPENAI_TIMEOUT` | `120` | 上游请求超时（秒） |
+| `OPENAI_TRUST_ENV` | `false` | 是否走系统代理；默认关闭，避免代理拦截内网/本地模型服务 |
+| `JWT_SECRET` | — | 令牌签名密钥（**生产必填**） |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `20160` | 令牌有效期（分钟，默认 14 天） |
+| `SMTP_HOST` / `SMTP_PORT` | 空 / `587` | SMTP 服务器 |
+| `SMTP_USER` / `SMTP_PASS` | 空 | SMTP 账号与密码（也可写作 `SMTP_USERNAME` / `SMTP_PASSWORD`；多数服务需用授权码） |
+| `SMTP_FROM` / `SMTP_FROM_NAME` | 空 / `NosChat` | 发件地址与显示名，`SMTP_FROM` 支持 `显示名 <地址>` 形式 |
+| `SMTP_STARTTLS` / `SMTP_SSL` | `true` / `false` | 587 用 STARTTLS；465 请设 `SMTP_SSL=true` 且 `SMTP_STARTTLS=false`（QQ、163 等） |
+| `AUTH_DEV_ECHO_CODE` | `false` | 未配置 SMTP 时是否把验证码回传前端（**仅本地开发**） |
+| `CODE_TTL_SECONDS` | `300` | 验证码有效期 |
+| `CODE_RESEND_INTERVAL_SECONDS` | `60` | 同邮箱重发间隔（限流） |
+| `CODE_MAX_ATTEMPTS` | `5` | 单个验证码最大校验次数 |
+| `MODELS_CONFIG_PATH` | `config/models.json` | 模型清单文件路径 |
+
+### 前端（`web/.env`）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `VITE_API_BASE_URL` | `http://127.0.0.1:9135` | 后端地址；设为空字符串时走 Vite 的 `/api` 代理（同源） |
+
+## 模型清单（`server/config/models.json`）
+
+模型由配置文件声明，前端启动后通过 `GET /api/models` 拉取，增删模型无需改前端代码。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `id` / `name` / `provider` | string | 唯一标识、展示名、厂商 |
+| `id` | string | 前端使用的唯一标识（必填） |
+| `model` | string | 上游真实模型名，缺省回落到 `id` |
+| `name` / `provider` | string | 展示名 / 厂商 |
 | `icon` / `color` / `badge` | string | 头像、主题色、角标 |
-| `desc` / `tags` | string / string[] | 简介与能力标签 |
+| `desc` / `tags` | string / string[] | **介绍**与能力标签 |
 | `context` | string | 上下文窗口（展示用） |
-| **`released`** | string | **发布日期（`YYYY-MM-DD`）**，用于列表展示、相对时间与排序 |
+| `released` | string | **发布日期** `YYYY-MM-DD`，用于展示、相对时间与排序 |
 | `speed` / `intelligence` | 1–5 | 能力条数值 |
-| `temp` | number | 演示用温度参数 |
-| `reasoning` | boolean | 是否为推理模型：`true` 时回复前生成「深度思考」内容 |
-| `latency` / `thinkLatency` | [min, max] | 模拟回答/思考耗时（毫秒） |
-| `replies` / `thinkTemplates` | string[] | 话术模板，`{q}` 为用户问题占位符 |
+| `temp` | number | 温度参数 |
+| `reasoning` | boolean | 是否为推理模型（决定思考链展示） |
+| `latency` | [min, max] | 响应耗时估算（毫秒，前端信息条展示） |
+| `base_url` | string | 可选：为单个模型覆盖全局 `OPENAI_BASE_URL` |
 
-辅助函数：`getModel(id)` 取模型、`mockReply(modelId, text)` 生成模拟回复（含 `thinking`、`thinkingSec`）、`relRelease(iso)` 把发布日期转为「N 个月前发布」。
-顶部工具栏的 🧠 开关控制深度思考面板的**默认**展开状态（写入 `localStorage.noschat.thinkOpen`），逐条点击只影响该条消息。
+修改后重启后端即可生效（compose 已把 `server/config` 挂载进容器）：
 
-## 模拟数据
+```bash
+docker compose restart api        # 或本地：重跑 python run.py
+```
 
-应用包含了完整的模拟数据：
-- 9 个候选模型（各带话术模板与发布日期）
-- 7 个示例对话，其中推理模型对话带「深度思考」内容用于折叠展示
-- 按所选模型随机生成回复，推理模型会先生成思考链再输出结论
-- 时间戳、思考用时与状态管理
+## 接口一览
 
-## 未来扩展方向
+| 方法 | 路径 | 说明 | 鉴权 |
+| --- | --- | --- | --- |
+| GET | `/health` | 健康检查（含已加载模型数） | 否 |
+| POST | `/api/auth/send-code` | 发送注册验证码（同邮箱 60s 限流） | 否 |
+| POST | `/api/auth/register` | 邮箱验证码注册（成功即返回令牌） | 否 |
+| POST | `/api/auth/login` | 邮箱 + 密码登录 | 否 |
+| GET | `/api/auth/me` | 当前登录用户 | 是 |
+| GET | `/api/models` | 模型清单（含介绍 / 发布日期等） | 否 |
+| GET | `/api/conversations` | 会话列表（置顶优先、按更新时间倒序） | 是 |
+| POST | `/api/conversations` | 新建会话（附带欢迎消息） | 是 |
+| GET | `/api/conversations/{id}/messages` | 会话消息列表 | 是 |
+| PATCH | `/api/conversations/{id}` | 更新标题 / 模型 / 置顶 / 未读 | 是 |
+| DELETE | `/api/conversations/{id}` | 删除会话（级联删除消息） | 是 |
+| POST | `/api/chat/stream` | 流式对话（`text/event-stream`） | 是 |
 
-### 前端扩展
-1. **AI 集成**：接入真实的 AI API（如 OpenAI API、本地模型等）
-2. **用户界面**：
-   - 主题切换：亮色/暗色主题
-   - 国际化：多语言支持
-   - 高级设置：聊天参数配置
-3. **交互增强**：
-   - 消息复制/分享功能
-   - 对话导出（文本/PDF）
-   - 语音输入/输出
-4. **性能优化**：
-   - 虚拟滚动消息列表
-   - 图片懒加载
-   - 服务端渲染（SSR）
+### SSE 事件格式
 
-### 后端可集成
-1. **API 服务**：Node.js/Express、Python/FastAPI
-2. **数据库**：MongoDB、PostgreSQL、Redis
-3. **AI 服务**：
-   - OpenAI API
-   - Anthropic Claude
-   - 本地模型（Ollama、LM Studio）
-4. **用户系统**：
-   - 注册/登录
-   - 对话同步
-   - 使用统计
+```
+data: {"type":"start","conversationId":"...","userMessageId":"...","title":"...","preview":"..."}
+data: {"type":"thinking","delta":"..."}    # 推理模型的思考增量（可能没有）
+data: {"type":"content","delta":"..."}     # 回答增量
+data: {"type":"done","conversationId":"...","messageId":"...","title":"...","preview":"..."}
+data: {"type":"error","message":"..."}     # 上游失败等错误（不会写入空消息）
+```
 
-## 设计亮点
+## 数据模型
 
-- **无 UI 库依赖**：完全使用原生 HTML/CSS 实现现代化界面
-- **交互动画**：丰富的过渡和状态动画
-- **响应式布局**：从小屏幕到大屏幕的完美适配
-- **性能优化**：虚拟滚动消息列表（可扩展）
-- **无障碍访问**：基本的键盘导航和 ARIA 支持
+| 表 | 关键字段 | 说明 |
+| --- | --- | --- |
+| `users` | `email`(唯一)、`nickname`、`hashed_password`、`is_active` | 以邮箱为登录账号，密码 bcrypt 存储 |
+| `email_verifications` | `email`、`purpose`、`code_hash`、`expires_at`、`consumed_at`、`attempts` | 验证码只存哈希，含过期与次数限制 |
+| `conversations` | `id`、`user_id`、`title`、`model_id`、`preview`、`pinned`、`unread` | 按 `user_id` + `pinned` + `updated_at` 建索引 |
+| `messages` | `id`、`conversation_id`、`role`、`model_id`、`content`、`thinking`、`thinking_sec` | 按 `conversation_id` + `created_at` 建索引 |
 
-## 开发指南
+表结构在服务启动时自动创建（幂等）。
 
-### 代码结构
-- **组件化设计**：每个功能模块都是独立的 Vue 组件
-- **响应式数据**：使用 Vue Composition API 管理状态
-- **样式隔离**：使用 CSS Scoped 避免样式冲突
-- **模拟数据**：开发阶段使用本地模拟数据
+## 安全说明
 
-### 添加新功能
-1. 在 `src/components/` 创建新组件
-2. 在 `App.vue` 中注册和使用
-3. 更新模拟数据和状态管理
-4. 添加对应的样式
+- 密码使用 bcrypt 哈希，验证码以 HMAC-SHA256 哈希入库，二者都不落明文。
+- 访问令牌为 JWT（默认 14 天），所有会话/消息接口都校验令牌并校验资源归属。
+- `JWT_SECRET` 必须替换为随机长字符串：`python -c "import secrets;print(secrets.token_urlsafe(48))"`。
+- 生产环境请关闭 `AUTH_DEV_ECHO_CODE`，并只把数据库端口暴露在内网（compose 默认不映射 `db` 端口）。
+- 后端镜像以非 root 用户运行，`.env` 已通过 `.dockerignore` 排除，不会打进镜像。
 
-### 集成真实 API
-1. 创建 API 服务层
-2. 替换模拟数据为真实调用
-3. 添加加载状态和错误处理
-4. 实现消息持久化
+## 常见问题
+
+1. **前端报「无法连接后端服务」**：确认后端已在 `9135` 启动（`GET /health`），并检查 `CORS_ORIGINS` 是否包含前端地址。
+2. **发送验证码返回 503**：未配置 `SMTP_HOST`。配置真实 SMTP，或本地开发时设置 `AUTH_DEV_ECHO_CODE=true` 直接回传验证码。
+3. **Windows 启动报 ProactorEventLoop**：请用 `python run.py` 启动（见上文提示）。
+4. **模型调用报 502 / Connection error**：多为本机代理软件拦截，确认 `OPENAI_TRUST_ENV=false`，或把 `OPENAI_BASE_URL` 指向可达地址。
+5. **切换模型后提示保存失败**：模型 id 必须存在于 `server/config/models.json`。
 
 ## 许可证
 

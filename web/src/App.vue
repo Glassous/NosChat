@@ -164,29 +164,33 @@ import ChatMessages from './components/ChatMessages.vue'
 import ChatInput from './components/ChatInput.vue'
 import ModelSelector from './components/ModelSelector.vue'
 import AuthPage from './components/AuthPage.vue'
-import { MODEL_LIST, MOCK_CONVERSATIONS, MOCK_MESSAGES, getModel, mockReply } from './data/models.js'
+import { MODEL_LIST, getModel, setModels } from './data/models.js'
 import { useAuth } from './stores/userStore.js'
+import {
+  createConversation,
+  deleteConversation,
+  fetchConversations,
+  fetchMessages,
+  fetchModels,
+  streamChat,
+  updateConversation
+} from './api/chat.js'
+import { fmtClock, fmtRelative, nowClock } from './utils/time.js'
 
 // 用户认证状态
 const { isAuthenticated, currentUser, logout: authLogout } = useAuth()
 
 // 聊天应用状态
-const conversations = ref(
-  MOCK_CONVERSATIONS.map(c => ({
-    ...c,
-    preview: lastPreview(c.id)
-  }))
-)
+const conversations = ref([])
+const messages = reactive({})
 
-const messages = reactive({ ...MOCK_MESSAGES })
-
-const activeConversationId = ref(conversations.value[0]?.id ?? '')
+const activeConversationId = ref('')
 const inputMessage = ref('')
 const isLoading = ref(false)
 const sidebarOpen = ref(false)
 const pendingDelete = ref(null)
 const toast = ref('')
-const selectedModelId = ref(localStorage.getItem('noschat.model') || MODEL_LIST[0].id)
+const selectedModelId = ref(localStorage.getItem('noschat.model') || '')
 
 // 深度思考区块的默认展开状态
 const thinkDefaultOpen = ref(localStorage.getItem('noschat.thinkOpen') === '1')
@@ -195,8 +199,8 @@ watch(thinkDefaultOpen, value => localStorage.setItem('noschat.thinkOpen', value
 let seq = 0
 const uid = () => `${Date.now()}-${++seq}`
 
-// 当前流式回复的定时器
-let streamTimer = null
+// 当前流式回复的中断控制器
+let streamController = null
 const streamConversationId = ref('')
 
 // 只有正在生成的那个对话才显示「生成中」占位气泡
@@ -204,17 +208,11 @@ const loadingInActive = computed(
   () => isLoading.value && streamConversationId.value === activeConversationId.value
 )
 
-function clearStreamTimer() {
-  if (streamTimer) {
-    clearInterval(streamTimer)
-    streamTimer = null
+function abortStream() {
+  if (streamController) {
+    streamController.abort()
+    streamController = null
   }
-}
-
-function lastPreview(id) {
-  const list = MOCK_MESSAGES[id]
-  if (!list || !list.length) return '开始新的对话…'
-  return previewOf(list[list.length - 1].content) || '开始新的对话…'
 }
 
 function previewOf(text) {
@@ -223,7 +221,26 @@ function previewOf(text) {
 }
 
 function nowTime() {
-  return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return nowClock()
+}
+
+/** 后端消息 → 界面消息 */
+function toLocalMessage(row) {
+  return {
+    id: row.id,
+    type: row.type,
+    model: row.model,
+    content: row.content || '',
+    thinking: row.thinking || '',
+    thinkingSec: row.thinkingSec || 0,
+    phase: 'done',
+    timestamp: fmtClock(row.createdAt)
+  }
+}
+
+/** 后端会话 → 界面会话 */
+function toLocalConversation(row) {
+  return { ...row, timestamp: fmtRelative(row.updatedAt) }
 }
 
 const currentConversation = computed(() =>
@@ -239,7 +256,56 @@ function showToast(text) {
   setTimeout(() => { if (toast.value === text) toast.value = '' }, 2200)
 }
 
-function selectConversation(id) {
+async function loadModels() {
+  const list = await fetchModels()
+  setModels(list)
+  if (!MODEL_LIST.some(model => model.id === selectedModelId.value)) {
+    selectedModelId.value = MODEL_LIST[0]?.id || ''
+  }
+}
+
+async function loadMessages(id, { force = false } = {}) {
+  if (!id) return
+  if (messages[id] && !force) return
+  const rows = await fetchMessages(id)
+  messages[id] = (rows || []).map(toLocalMessage)
+}
+
+async function loadConversations() {
+  const rows = await fetchConversations()
+  conversations.value = (rows || []).map(toLocalConversation)
+
+  if (!conversations.value.some(item => item.id === activeConversationId.value)) {
+    activeConversationId.value = conversations.value[0]?.id || ''
+  }
+
+  // 新账号没有任何会话时，自动开一个（保证输入框始终可用）
+  if (!conversations.value.length) {
+    await createNewConversation()
+    return
+  }
+
+  if (activeConversationId.value) await loadMessages(activeConversationId.value)
+}
+
+// 登录后一次性拉取模型清单与会话列表（幂等）
+let bootstrapping = null
+function bootstrap() {
+  if (bootstrapping) return bootstrapping
+  bootstrapping = (async () => {
+    try {
+      await loadModels()
+      await loadConversations()
+    } catch (error) {
+      showToast(error?.message || '加载数据失败')
+    } finally {
+      bootstrapping = null
+    }
+  })()
+  return bootstrapping
+}
+
+async function selectConversation(id) {
   activeConversationId.value = id
   const conversation = conversations.value.find(c => c.id === id)
   if (conversation) {
@@ -247,38 +313,39 @@ function selectConversation(id) {
     if (conversation.model) selectedModelId.value = conversation.model
   }
   sidebarOpen.value = false
+  try {
+    await loadMessages(id)
+  } catch (error) {
+    showToast(error?.message || '加载消息失败')
+  }
 }
 
-function createNewConversation() {
-  const newId = uid()
-  conversations.value.unshift({
-    id: newId,
-    title: '新对话',
-    preview: '开始新的对话…',
-    timestamp: '刚刚',
-    pinned: false,
-    unread: false,
-    model: selectedModelId.value
-  })
-  messages[newId] = [
-    {
-      id: uid(),
-      type: 'ai',
-      model: selectedModelId.value,
-      content: `你好，${currentUser.value?.nickname || '朋友'}！当前模型是 ${currentModel.value.name}。有什么可以帮你的吗？`,
-      timestamp: nowTime()
-    }
-  ]
-  activeConversationId.value = newId
-  sidebarOpen.value = false
-  showToast('已创建新对话')
+async function createNewConversation() {
+  try {
+    const data = await createConversation({ model: selectedModelId.value })
+    const conversation = toLocalConversation(data.conversation)
+    conversations.value.unshift(conversation)
+    messages[conversation.id] = (data.messages || []).map(toLocalMessage)
+    activeConversationId.value = conversation.id
+    sidebarOpen.value = false
+    showToast('已创建新对话')
+  } catch (error) {
+    showToast(error?.message || '新建对话失败')
+  }
 }
 
-function editConversation({ id, title }) {
+async function editConversation({ id, title }) {
   const conversation = conversations.value.find(c => c.id === id)
-  if (conversation && title && conversation.title !== title) {
-    conversation.title = title
+  if (!conversation || !title || conversation.title === title) return
+
+  const previous = conversation.title
+  conversation.title = title
+  try {
+    await updateConversation(id, { title })
     showToast('标题已更新')
+  } catch (error) {
+    conversation.title = previous
+    showToast(error?.message || '标题更新失败')
   }
 }
 
@@ -287,21 +354,28 @@ function askDeleteConversation(id) {
   if (conversation) pendingDelete.value = conversation
 }
 
-function confirmDelete() {
+async function confirmDelete() {
   const target = pendingDelete.value
   if (!target) return
   pendingDelete.value = null
 
+  try {
+    await deleteConversation(target.id)
+  } catch (error) {
+    showToast(error?.message || '删除对话失败')
+    return
+  }
+
   const index = conversations.value.findIndex(c => c.id === target.id)
-  if (index === -1) return
-  conversations.value.splice(index, 1)
+  if (index !== -1) conversations.value.splice(index, 1)
   delete messages[target.id]
 
   if (target.id === activeConversationId.value) {
     if (conversations.value.length) {
       activeConversationId.value = conversations.value[0].id
+      loadMessages(activeConversationId.value).catch(() => {})
     } else {
-      createNewConversation()
+      await createNewConversation()
     }
   }
   showToast('对话已删除')
@@ -312,20 +386,25 @@ function useSuggestion(text) {
   sendMessage()
 }
 
-function sendMessage() {
+async function sendMessage() {
   const content = inputMessage.value.trim()
   if (!content || isLoading.value) return
 
   const id = activeConversationId.value
+  if (!id) {
+    showToast('请先新建对话')
+    return
+  }
   if (!messages[id]) messages[id] = []
 
+  // 乐观渲染用户消息
   messages[id].push({ id: uid(), type: 'user', content, timestamp: nowTime() })
 
   const conversation = currentConversation.value
   if (conversation) {
     conversation.preview = previewOf(content)
     conversation.timestamp = '刚刚'
-    // 首次提问时用问题内容自动命名
+    // 首次提问时用问题内容自动命名（后端会返回最终标题）
     if (conversation.title === '新对话') {
       conversation.title = content.length > 16 ? content.slice(0, 16) + '…' : content
     }
@@ -334,87 +413,109 @@ function sendMessage() {
   inputMessage.value = ''
   isLoading.value = true
 
-  const reply = mockReply(selectedModelId.value, content)
-  const [min, max] = reply.latency
-  const total = min + Math.random() * (max - min)
-
-  // 有深度思考的模型：先逐字吐思考，再逐字吐结论
-  const TICK = 50
-  const thinkMs = reply.thinking ? total * 0.6 : 0
-  const answerMs = Math.max(TICK, total - thinkMs)
-  const thinkStep = Math.max(2, Math.ceil((reply.thinking || '').length / (thinkMs / TICK)))
-  const answerStep = Math.max(2, Math.ceil(reply.content.length / (answerMs / TICK)))
-
   const msgId = uid()
   messages[id].push({
     id: msgId,
     type: 'ai',
-    model: reply.model,
+    model: selectedModelId.value,
     content: '',
     thinking: '',
     thinkingSec: 0,
-    phase: reply.thinking ? 'think' : 'answer',
+    phase: 'answer',
     timestamp: nowTime()
   })
 
   const thinkStart = Date.now()
   streamConversationId.value = id
-  clearStreamTimer()
+  abortStream()
+  streamController = new AbortController()
+  let streamError = ''
 
-  const finish = () => {
-    clearStreamTimer()
+  try {
+    const result = await streamChat({
+      conversationId: id,
+      model: selectedModelId.value,
+      content,
+      signal: streamController.signal,
+      onEvent(event) {
+        // 等待期间可能已切换或删除对话
+        const list = messages[id]
+        const message = list && list.find(item => item.id === msgId)
+
+        if (event.type === 'start') {
+          const target = conversations.value.find(c => c.id === id)
+          if (target) {
+            if (event.title) target.title = event.title
+            if (event.preview) target.preview = event.preview
+            target.timestamp = '刚刚'
+          }
+          return
+        }
+        if (!message) return
+
+        if (event.type === 'thinking') {
+          message.thinking += event.delta
+          message.thinkingSec = Math.max(1, Math.round((Date.now() - thinkStart) / 1000))
+          message.phase = 'think'
+        } else if (event.type === 'content') {
+          message.content += event.delta
+          message.phase = 'answer'
+        } else if (event.type === 'done') {
+          message.phase = 'done'
+        }
+      }
+    })
+    streamError = result?.error || ''
+  } catch (error) {
+    if (error?.name !== 'AbortError') streamError = error?.message || '生成回复失败'
+  } finally {
+    streamController = null
     isLoading.value = false
     if (streamConversationId.value === id) streamConversationId.value = ''
+
+    const list = messages[id]
+    const message = list && list.find(item => item.id === msgId)
+    if (message) {
+      message.phase = 'done'
+      // 完全没有产出的失败回复不予保留，避免留下空气泡
+      if (!message.content && !message.thinking) {
+        const index = list.indexOf(message)
+        if (index !== -1) list.splice(index, 1)
+      }
+    }
+
     const target = conversations.value.find(c => c.id === id)
-    if (target) {
-      target.preview = previewOf(reply.content)
+    if (target && message?.content) {
+      target.preview = previewOf(message.content)
       target.timestamp = '刚刚'
     }
+    if (streamError) showToast(streamError)
   }
-
-  streamTimer = setInterval(() => {
-    const list = messages[id]
-    // 等待期间可能已切换或删除对话
-    const msg = list && list.find(item => item.id === msgId)
-    if (!msg) {
-      finish()
-      return
-    }
-
-    if (msg.phase === 'think') {
-      msg.thinking = reply.thinking.slice(0, msg.thinking.length + thinkStep)
-      msg.thinkingSec = Math.max(1, Math.round((Date.now() - thinkStart) / 1000))
-      if (msg.thinking.length >= reply.thinking.length) {
-        msg.thinking = reply.thinking
-        msg.phase = 'answer'
-      }
-    } else if (msg.phase === 'answer') {
-      msg.content = reply.content.slice(0, msg.content.length + answerStep)
-      if (msg.content.length >= reply.content.length) {
-        msg.content = reply.content
-        msg.phase = 'done'
-        finish()
-      }
-    } else {
-      finish()
-    }
-  }, TICK)
 }
 
 function onModelChange(model) {
   const conversation = currentConversation.value
-  if (conversation) conversation.model = model.id
+  if (conversation) {
+    conversation.model = model.id
+    updateConversation(conversation.id, { model: model.id }).catch(error => {
+      showToast(error?.message || '模型切换保存失败')
+    })
+  }
   localStorage.setItem('noschat.model', model.id)
   showToast(`已切换到 ${model.name}`)
 }
 
 function handleAuthSuccess() {
   showToast('登录成功！')
-  // 可以在这里添加其他登录成功后的逻辑
+  bootstrap()
 }
 
 function handleLogout() {
+  abortStream()
   authLogout()
+  conversations.value = []
+  Object.keys(messages).forEach(key => { delete messages[key] })
+  activeConversationId.value = ''
   showToast('已退出登录')
 }
 
@@ -425,6 +526,11 @@ function getAvatarInitial(name) {
 
 watch(activeConversationId, () => {
   sidebarOpen.value = false
+})
+
+// 登录成功后加载模型清单与历史会话
+watch(isAuthenticated, value => {
+  if (value) bootstrap()
 })
 
 // 响应式：>900px 内联侧栏，<=900px 收进抽屉
@@ -440,12 +546,13 @@ function onViewportChange(e) {
 
 onMounted(() => {
   mql?.addEventListener('change', onViewportChange)
+  if (isAuthenticated.value) bootstrap()
   console.log('NosChat AI 聊天应用已启动', { isAuthenticated: isAuthenticated.value })
 })
 
 onBeforeUnmount(() => {
   mql?.removeEventListener('change', onViewportChange)
-  clearStreamTimer()
+  abortStream()
 })
 </script>
 
