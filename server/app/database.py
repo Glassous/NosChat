@@ -28,10 +28,10 @@ class Base(DeclarativeBase):
 def _create_engine() -> AsyncEngine:
     kwargs: dict[str, object] = {"echo": settings.db_echo, "pool_pre_ping": True}
     # SQLite 等非连接池驱动不支持 pool_size/max_overflow
-    if settings.database_url.startswith("postgresql"):
+    if settings.database_dsn.startswith("postgresql"):
         kwargs["pool_size"] = settings.db_pool_size
         kwargs["max_overflow"] = settings.db_max_overflow
-    return create_async_engine(settings.database_url, **kwargs)
+    return create_async_engine(settings.database_dsn, **kwargs)
 
 
 engine: AsyncEngine = _create_engine()
@@ -64,7 +64,7 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        if settings.database_url.startswith("postgresql"):
+        if settings.database_dsn.startswith("postgresql"):
             for statement in _LIGHT_MIGRATIONS:
                 await conn.execute(text(statement))
     logger.info("数据库表结构已就绪")

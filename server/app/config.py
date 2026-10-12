@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,7 +31,13 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
 
     # ---- 数据库（PostgreSQL）----
-    database_url: str = "postgresql+psycopg://noschat:noschat@localhost:5432/noschat"
+    # 优先使用完整连接串 DATABASE_URL；未设置时由下面的 POSTGRES_* 分片拼装
+    database_url: str = ""
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_user: str = "noschat"
+    postgres_password: str = "noschat"
+    postgres_db: str = "noschat"
     db_echo: bool = False
     db_pool_size: int = 5
     db_max_overflow: int = 10
@@ -90,6 +97,24 @@ class Settings(BaseSettings):
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
     @property
+    def database_dsn(self) -> str:
+        """最终使用的数据库连接串（DATABASE_URL 优先，否则由 POSTGRES_* 拼装）。"""
+        if self.database_url.strip():
+            return self.database_url.strip()
+        user = quote(self.postgres_user, safe="")
+        password = quote(self.postgres_password, safe="")
+        database = quote(self.postgres_db, safe="")
+        return (
+            f"postgresql+psycopg://{user}:{password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{database}"
+        )
+
+    @property
+    def jwt_secret_is_default(self) -> bool:
+        """是否仍在使用默认/空密钥（启动时给出警告）。"""
+        return self.jwt_secret.strip() in {"", "please-change-this-secret"}
+
+    @property
     def smtp_enabled(self) -> bool:
         """是否具备真实发信能力。"""
         return bool(self.smtp_host)
@@ -100,6 +125,11 @@ class Settings(BaseSettings):
         if not path.is_absolute():
             path = BASE_DIR / path
         return path
+
+    @property
+    def env_file_path(self) -> Path:
+        """server/.env 路径（供 MODEL_* 等动态环境变量读取）。"""
+        return BASE_DIR / ".env"
 
 
 @lru_cache(maxsize=1)

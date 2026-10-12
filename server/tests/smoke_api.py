@@ -67,8 +67,15 @@ def main() -> None:
             _fail(f"模型清单失败：{models.status_code} {models.text}")
         model_list = models.json()
         if not model_list:
-            _fail("模型清单为空（请检查 server/config/models.json）")
-        _ok(f"模型清单：{len(model_list)} 个，首个={model_list[0]['id']} latency={model_list[0]['latency']}")
+            _fail("模型清单为空（请检查 server/.env 的 MODEL_* 或 server/config/models.json）")
+        # 优先选用推理模型，以便校验思考链增量；没有则退化为首个模型
+        reasoning_model = next((item for item in model_list if item.get("reasoning")), None)
+        target_model = reasoning_model or model_list[0]
+        model_id = target_model["id"]
+        _ok(
+            f"模型清单：{len(model_list)} 个，用例模型={model_id}"
+            f"（reasoning={bool(reasoning_model)}，latency={target_model['latency']}）"
+        )
 
         # 3. 发送验证码
         code_resp = client.post(f"{api}/auth/send-code", json={"email": email})
@@ -106,7 +113,7 @@ def main() -> None:
         _ok(f"重复发送验证码被正确拒绝：{again.status_code}")
 
         # 7. 新建会话
-        created = client.post(f"{api}/conversations", json={"model": "deepseek-r1"}, headers=auth)
+        created = client.post(f"{api}/conversations", json={"model": model_id}, headers=auth)
         if created.status_code != 201:
             _fail(f"新建会话失败：{created.status_code} {created.text}")
         payload = created.json()
@@ -121,7 +128,7 @@ def main() -> None:
             "POST",
             f"{api}/chat/stream",
             headers=auth,
-            json={"conversationId": conversation_id, "model": "deepseek-r1", "content": "帮我算一下 1+1"},
+            json={"conversationId": conversation_id, "model": model_id, "content": "用一句话介绍你自己"},
         ) as response:
             if response.status_code != 200:
                 _fail(f"流式对话失败：{response.status_code} {response.read()[:200]}")
@@ -140,11 +147,14 @@ def main() -> None:
 
         if not done:
             _fail("未收到 done 事件")
-        if not thinking:
-            _fail("推理模型未返回 thinking 增量")
         if not content:
             _fail("未返回 content 增量")
-        _ok(f"流式对话：thinking={len(''.join(thinking))} 字，content={len(''.join(content))} 字")
+        if reasoning_model and not thinking:
+            _fail("推理模型未返回 thinking 增量")
+        _ok(
+            f"流式对话（{model_id}）：thinking={len(''.join(thinking))} 字，"
+            f"content={len(''.join(content))} 字"
+        )
 
         # 9. 消息落库
         messages = client.get(f"{api}/conversations/{conversation_id}/messages", headers=auth)
@@ -152,8 +162,10 @@ def main() -> None:
         if len(rows) != 3:
             _fail(f"消息数量异常（期望 3）：{len(rows)}")
         assistant = rows[-1]
-        if assistant["type"] != "ai" or not assistant["content"] or not assistant["thinking"]:
+        if assistant["type"] != "ai" or not assistant["content"]:
             _fail(f"助手消息落库异常：{assistant}")
+        if reasoning_model and not assistant["thinking"]:
+            _fail("推理模型的思考内容未落库")
         _ok(f"消息落库：{len(rows)} 条，thinkingSec={assistant['thinkingSec']}")
 
         # 10. 会话列表 / 重命名 / 删除

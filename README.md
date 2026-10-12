@@ -67,7 +67,8 @@ NosChat/
 │   │   ├── llm.py                            # AsyncOpenAI 流式调用（含友好错误映射）
 │   │   ├── model_registry.py                 # 模型清单加载与兜底
 │   │   └── routers/{auth,catalog,chat}.py    # 认证 / 模型清单 / 会话与流式对话
-│   ├── config/models.json                    # 模型清单（介绍、发布日期、标签等）
+│   ├── config/models.json                    # 模型清单备用来源（介绍、发布日期、标签等）
+│   ├── scripts/export_models_env.py          # 把 models.json 导出为 .env 的 MODEL_* 写法
 │   ├── tests/{smoke_api.py,mock_llm.py}      # 接口冒烟测试、本地 Mock 模型服务
 │   ├── requirements.txt
 │   ├── Dockerfile
@@ -84,18 +85,19 @@ NosChat/
 │       ├── App.vue                           # 改造：真实模型清单 / SSE / 会话持久化（模板不变）
 │       └── ...                               # 其余组件未改动
 ├── docker-compose.yml                        # 后端 + PostgreSQL（不含前端）
-├── .env.example                              # compose 环境变量样例
 └── check-project-structure.js                # 项目结构自检
 ```
+
+> 环境变量只有一处：`server/.env`（从 `server/.env.example` 复制）。compose 与本地运行都读它，根目录不再需要 `.env`。
 
 ## 快速开始
 
 ### 方式一：容器化（后端 + PostgreSQL）
 
 ```bash
-# 1) 准备环境变量（Windows PowerShell：Copy-Item .env.example .env）
-cp .env.example .env
-# 必填：JWT_SECRET、OPENAI_API_KEY、OPENAI_BASE_URL、SMTP_*
+# 1) 准备环境变量（Windows PowerShell：Copy-Item server\.env.example server\.env）
+cp server/.env.example server/.env
+# 必填：JWT_SECRET、OPENAI_*、SMTP_*、MODEL_*（模型清单与介绍也在这里维护）
 
 # 2) 构建并启动
 docker compose up -d --build
@@ -115,7 +117,7 @@ cd web && npm install && npm run dev     # http://localhost:3000
 cd server
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt     # Linux/macOS: .venv/bin/pip
-cp .env.example .env                              # 填写 DATABASE_URL / OPENAI_* / SMTP_*
+cp .env.example .env                              # 填写 POSTGRES_* / OPENAI_* / SMTP_* / MODEL_*
 python run.py                                     # http://localhost:9135
 
 # 前端（另开终端）
@@ -143,14 +145,16 @@ python tests/mock_llm.py             # 127.0.0.1:9901
 
 ## 环境变量
 
-### 后端（`server/.env`）与容器编排（根目录 `.env`）
+### 后端（`server/.env`，compose 与本地运行共用同一份）
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `9135` | 后端监听端口 |
 | `DEBUG` | `false` | 调试日志 |
 | `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | 允许的前端来源，逗号分隔 |
-| `DATABASE_URL` | `postgresql+psycopg://noschat:noschat@localhost:5432/noschat` | PostgreSQL 连接串（compose 内为 `@db:5432`） |
+| `POSTGRES_HOST` / `POSTGRES_PORT` | `localhost` / `5432` | 数据库地址；容器部署时 compose 会把 host 覆盖为服务名 `db` |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `noschat` | 数据库账号与库名（同时供 postgres 容器初始化使用） |
+| `DATABASE_URL` | 空 | 可选：直接给完整连接串（设置后优先于上面的 `POSTGRES_*`） |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容接口地址（**一个**） |
 | `OPENAI_API_KEY` | 空 | 接口密钥（**一个**，必填） |
 | `OPENAI_TIMEOUT` | `120` | 上游请求超时（秒） |
@@ -165,7 +169,8 @@ python tests/mock_llm.py             # 127.0.0.1:9901
 | `CODE_TTL_SECONDS` | `300` | 验证码有效期 |
 | `CODE_RESEND_INTERVAL_SECONDS` | `60` | 同邮箱重发间隔（限流） |
 | `CODE_MAX_ATTEMPTS` | `5` | 单个验证码最大校验次数 |
-| `MODELS_CONFIG_PATH` | `config/models.json` | 模型清单文件路径 |
+| `MODEL_1`、`MODEL_2`… | 空 | 在 `.env` 里声明模型清单（`id=xx;name=yy;desc=zz…`），定义了即优先生效 |
+| `MODELS_CONFIG_PATH` | `config/models.json` | 未定义任何 `MODEL_*` 时使用的模型清单文件路径 |
 
 ### 前端（`web/.env`）
 
@@ -173,9 +178,26 @@ python tests/mock_llm.py             # 127.0.0.1:9901
 | --- | --- | --- |
 | `VITE_API_BASE_URL` | `http://127.0.0.1:9135` | 后端地址；设为空字符串时走 Vite 的 `/api` 代理（同源） |
 
-## 模型清单（`server/config/models.json`）
+## 模型清单（`.env` 或 `server/config/models.json`）
 
-模型由配置文件声明，前端启动后通过 `GET /api/models` 拉取，增删模型无需改前端代码。
+模型清单支持两种维护方式，**二选一**（只要定义了任意 `MODEL_*` 就以环境变量为准，`models.json` 会被忽略）：
+
+**方式一（推荐）：直接写在 `.env` 里**，每个模型一行，字段用 `;` 分隔、`key=value` 形式：
+
+```env
+# 字段：id(必填) model name provider icon badge color desc tags context released
+#       speed(1-5) intelligence(1-5) temp reasoning latency base_url
+MODEL_1=id=deepseek-v3;model=deepseek-chat;name=DeepSeek-V3;provider=深度求索;icon=🐋;badge=推荐;color=#4d6bfe;desc=通用对话能力强，中文理解自然，响应速度快。;tags=通用,中文,性价比;context=64K;released=2024-12-27;speed=5;intelligence=4;temp=0.7;reasoning=false;latency=600-1200
+```
+
+- 编号只用于排序，可增删、可跳号；`desc` 就是界面上的「介绍」，`released` 是发布日期（`YYYY-MM-DD`）。
+- 未写的字段自动兜底（`icon=🤖`、`color=#667eea`、`speed/intelligence=3`、`temp=0.7`、`latency=600-1400`、`context=—`）。
+- 别名可用：`description`=`desc`、`date`=`released`、`upstream`/`model_name`=`model`、`temperature`=`temp`；标签支持 `,`、`|`、`、` 分隔；`latency` 支持 `600-1200`、`600,1200`、`600~1200`。
+- 字段拼错会记录 warning 并忽略该字段；`id` 缺失的条目会被跳过。
+
+**方式二：使用 `server/config/models.json`**（未定义任何 `MODEL_*` 时生效）。
+
+两种方式里，每个模型包含以下字段（前端启动后通过 `GET /api/models` 拉取，增删模型无需改前端代码）：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -192,10 +214,21 @@ python tests/mock_llm.py             # 127.0.0.1:9901
 | `latency` | [min, max] | 响应耗时估算（毫秒，前端信息条展示） |
 | `base_url` | string | 可选：为单个模型覆盖全局 `OPENAI_BASE_URL` |
 
-修改后重启后端即可生效（compose 已把 `server/config` 挂载进容器）：
+修改后重启后端即可生效：
 
 ```bash
-docker compose restart api        # 或本地：重跑 python run.py
+docker compose up -d api          # 改了 .env 需要重建容器（会重新注入环境变量）
+# 或本地开发：重跑 python run.py
+```
+
+`server/config/models.json` 的改动不需要重建镜像（compose 已把 `server/config` 挂载进容器），`docker compose restart api` 即可。
+
+从 JSON 生成 `.env` 写法（便于从方式二迁移到方式一）：
+
+```bash
+cd server
+python scripts/export_models_env.py                # 打印 MODEL_* 行
+python scripts/export_models_env.py -o models.env  # 写入文件
 ```
 
 ## 接口一览
@@ -264,7 +297,8 @@ data: {"type":"error","message":"..."}     # 上游失败等错误（不会写�
 2. **发送验证码返回 503**：未配置 `SMTP_HOST`。配置真实 SMTP，或本地开发时设置 `AUTH_DEV_ECHO_CODE=true` 直接回传验证码。
 3. **Windows 启动报 ProactorEventLoop**：请用 `python run.py` 启动（见上文提示）。
 4. **模型调用报 502 / Connection error**：多为本机代理软件拦截，确认 `OPENAI_TRUST_ENV=false`，或把 `OPENAI_BASE_URL` 指向可达地址。
-5. **切换模型后提示保存失败**：模型 id 必须存在于 `server/config/models.json`。
+5. **切换模型后提示保存失败**：模型 id 必须在模型清单中（`.env` 的 `MODEL_*` 或 `server/config/models.json`）。
+6. **模型清单没生效**：`server/.env` 里 `MODEL_*` 的字段拼写有误会被忽略并打 warning（`docker logs noschat-api | grep 模型`），`id` 缺失的条目会被跳过；改 `server/.env` 后需要 `docker compose up -d api` 重建容器重新注入变量。
 
 ## 许可证
 

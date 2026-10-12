@@ -1,13 +1,13 @@
 # NosChat 容器化部署：仅包含后端 API 与 PostgreSQL，不包含前端。
 # 前端可继续以 `cd web ; npm run dev`（开发）或独立部署静态产物（生产）。
 #
+# 环境变量统一放在 server/.env（后端唯一配置文件），两个服务都直接读取它：
+#   - db  需要 POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB（Postgres 官方镜像的变量名）
+#   - api 需要 OPENAI_* / JWT_* / SMTP_* / MODEL_* 等
 # 使用：
-#   1) 复制 .env.example 为 .env 并按需填写（至少设置 JWT_SECRET 与 OPENAI_API_KEY）
+#   1) 复制 server/.env.example 为 server/.env 并填写配置
 #   2) docker compose up -d --build
 #   3) 健康检查：http://localhost:9135/health
-#
-# 说明：api 服务通过 env_file 直接读取根目录 .env，未在 .env 中定义的变量不会被注入，
-#       因此 SMTP_USER/SMTP_PASS 与 SMTP_USERNAME/SMTP_PASSWORD 两种写法都可用。
 name: noschat
 
 services:
@@ -15,21 +15,20 @@ services:
     image: postgres:16-alpine
     container_name: noschat-db
     restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-noschat}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-noschat}
-      POSTGRES_DB: ${POSTGRES_DB:-noschat}
-      TZ: ${TZ:-Asia/Shanghai}
+    env_file:
+      - path: ./server/.env
+        required: true
     volumes:
       - noschat-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-noschat} -d ${POSTGRES_DB:-noschat}"]
+      # $$ 让变量在容器内展开，取值来自 server/.env
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 12
     # 如需从宿主机直连数据库排查，取消下面两行注释
     # ports:
-    #   - "${POSTGRES_PORT:-5432}:5432"
+    #   - "5432:5432"
     networks:
       - noschat
 
@@ -44,16 +43,16 @@ services:
       db:
         condition: service_healthy
     env_file:
-      - path: .env
-        required: false
+      - path: ./server/.env
+        required: true
     environment:
-      # ---- 容器内固定项（覆盖 .env 中同名值）----
-      PORT: ${PORT:-9135}
+      # 容器内固定监听 9135（如需改宿主端口，请修改下面的 ports 映射）
+      PORT: 9135
+      # 容器网络内通过服务名 db 访问数据库（覆盖 server/.env 里的 POSTGRES_HOST）
+      POSTGRES_HOST: db
       MODELS_CONFIG_PATH: config/models.json
-      # 数据库在容器网络内通过服务名 db 访问
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-noschat}:${POSTGRES_PASSWORD:-noschat}@db:5432/${POSTGRES_DB:-noschat}
     ports:
-      - "${PORT:-9135}:${PORT:-9135}"
+      - "9135:9135"
     volumes:
       # 挂载模型清单：修改 server/config/models.json 后 docker compose restart api 即可生效
       - ./server/config:/app/config:ro

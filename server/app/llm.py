@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -56,9 +57,16 @@ def get_client(base_url: str | None = None) -> AsyncOpenAI:
     return client
 
 
+def _normalize_base_url(url: str) -> str:
+    """规整 base url：去掉末尾斜杠，并把路径里重复的斜杠合并（如 https://x.top//v1）。"""
+    cleaned = re.sub(r"(?<!:)/{2,}", "/", url.strip())
+    return cleaned.rstrip("/")
+
+
 def _build_client(url: str) -> AsyncOpenAI:
     """创建上游客户端（显式控制超时与代理行为）。"""
     settings = get_settings()
+    url = _normalize_base_url(url)
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.openai_timeout, connect=15.0),
         trust_env=settings.openai_trust_env,

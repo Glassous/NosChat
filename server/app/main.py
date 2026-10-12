@@ -67,6 +67,12 @@ async def lifespan(app: FastAPI):
     registry.load()
     await _wait_for_database()
     await init_db()
+
+    if settings.jwt_secret_is_default:
+        logger.warning("JWT_SECRET 仍为默认值，请在生产环境中替换为随机长字符串")
+    if not settings.smtp_enabled and not settings.auth_dev_echo_code:
+        logger.warning("未配置 SMTP 且未开启 AUTH_DEV_ECHO_CODE，注册/登录将无法发送验证码")
+
     logger.info(
         "NosChat API 已启动：port=%s models=%d cors=%s",
         settings.port,
