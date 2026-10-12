@@ -84,6 +84,9 @@ NosChat/
 │       ├── components/ModelSelector.vue      # 微调：清单为空时的兜底，避免渲染报错
 │       ├── App.vue                           # 改造：真实模型清单 / SSE / 会话持久化（模板不变）
 │       └── ...                               # 其余组件未改动
+├── .github/workflows/                        # GitHub Actions（云端构建 + 传输部署）
+│   ├── deploy-web.yml                        #   前端 → 1Panel 站点 index/dist
+│   └── deploy-api.yml                        #   后端 → /opt/noschat（镜像 + compose）
 ├── docker-compose.yml                        # 后端 + PostgreSQL（不含前端）
 └── check-project-structure.js                # 项目结构自检
 ```
@@ -102,7 +105,7 @@ cp server/.env.example server/.env
 # 2) 构建并启动
 docker compose up -d --build
 
-# 3) 健康检查
+# 3) 健康检查（容器只监听本机 127.0.0.1:9135，由反向代理对外提供服务）
 curl http://localhost:9135/health
 # {"status":"ok","version":"1.0.0","models":9}
 
@@ -141,6 +144,88 @@ python tests/smoke_api.py            # 覆盖注册/登录/模型/会话/SSE/错
 cd server
 python tests/mock_llm.py             # 127.0.0.1:9901
 # server/.env 中设置 OPENAI_BASE_URL=http://127.0.0.1:9901/v1
+```
+
+## 自动部署（GitHub Actions）
+
+两个工作流都在 **GitHub 云端构建**，构建完成后通过 SSH 把产物传到服务器（服务器上不做构建）：
+
+| 工作流 | 触发条件 | 云端构建 | 服务器上的结果 |
+| --- | --- | --- | --- |
+| `deploy-web.yml` | `web/**` 变更推送 main | `npm ci && npm run build` 后打包 | 解压到 `/opt/1panel/www/sites/noschat.vodyanitsa.top/index/dist` |
+| `deploy-api.yml` | `server/**`、`docker-compose.yml` 变更推送 main | `docker build` 后端镜像并 `docker save \| gzip` | `docker load` → `docker compose up -d`（同时同步 compose 与 `server/` 源码） |
+
+两者都支持在 Actions 页面手动触发（`workflow_dispatch`）。
+
+### 仓库 Secrets（Settings → Secrets and variables → Actions）
+
+| 名称 | 说明 |
+| --- | --- |
+| `SERVER_HOST` | 服务器 IP 或域名 |
+| `SERVER_USER` | SSH 用户名（需对部署目录有写权限，或直接用 root） |
+| `SERVER_SSH_KEY` | 该用户的**私钥**全文（`-----BEGIN ... PRIVATE KEY-----` 起止都要，建议 ed25519） |
+
+可选 Repository **Variable**：`VITE_API_BASE_URL` —— 留空时前端请求同源 `/api`（由 Nginx 反代到后端，推荐）；若要前端直连其它域名再填。
+
+### 服务器一次性准备
+
+```bash
+# 后端目录（CI 会把 docker-compose.yml 与 server/ 源码同步过来，但不会覆盖 .env）
+mkdir -p /opt/noschat/server
+cd /opt/noschat
+cp server/.env.example server/.env     # CI 首次同步后该文件才存在；也可手动创建
+vi server/.env                         # 填 OPENAI_* / JWT_SECRET / SMTP_* / POSTGRES_* / MODEL_*
+# 容器内的 POSTGRES_HOST 由 compose 覆盖为 db，这里保持 localhost 即可
+
+# 前端目录（1Panel 站点目录）
+mkdir -p /opt/1panel/www/sites/noschat.vodyanitsa.top/index/dist
+```
+
+> 服务器上需要已安装 Docker（含 compose 插件）；`/opt/noschat/server/.env` 不会被 CI 覆盖，首次部署前必须先准备好。
+
+### 反向代理（1Panel 面板创建）
+
+推荐直接在 1Panel 面板配置，站点保持「**静态网站**」（不要建成「反向代理」类型，否则前端也会被转发到后端）：
+
+1. 网站 → 选择站点 → **网站目录 → 运行目录** 选 `/dist`（即 `.../index/dist`）；
+2. 网站 → 选择站点 → **反向代理 → 添加**：
+   - 名称：`api`
+   - 路径 / 匹配路径：`/api`
+   - 代理地址：`http://127.0.0.1:9135`
+3. 在该代理的**自定义配置 / 高级设置**里补上（面板默认不会开，缺了会导致流式回答卡住或一次性吐出）：
+
+```nginx
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_buffering off;
+proxy_cache off;
+proxy_request_buffering off;
+proxy_read_timeout 3600s;
+proxy_send_timeout 3600s;
+```
+
+要点：
+
+- 静态根目录指向 `/opt/1panel/www/sites/noschat.vodyanitsa.top/index/dist`，并保证有 `try_files $uri $uri/ /index.html`（单页应用回落）；
+- **代理地址末尾不要加斜杠**：写 `http://127.0.0.1:9135`，不要写 `http://127.0.0.1:9135/`，否则会丢掉 `/api` 前缀导致全部 404；
+- compose 只把 9135 绑定在 `127.0.0.1`，不直接对外暴露；
+- 若面板不支持自定义路径（只允许 `/`），改用「配置文件」方式，在 `server` 块里加：
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:9135;   # 末尾不要加斜杠，否则会丢掉 /api 前缀
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection        "";
+    proxy_buffering         off;
+    proxy_cache             off;
+    proxy_request_buffering off;
+    proxy_read_timeout      3600s;
+    proxy_send_timeout      3600s;
+}
 ```
 
 ## 环境变量

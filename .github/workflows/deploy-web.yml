@@ -1,0 +1,95 @@
+name: Deploy Web (frontend)
+
+# 触发：main 分支下 web/ 有改动时自动部署；也可在 Actions 页面手动触发
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - '.github/workflows/deploy-web.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-web
+  cancel-in-progress: true
+
+env:
+  # 1Panel 站点目录；前端产物最终放在 <此目录>/dist
+  WEB_TARGET_DIR: /opt/1panel/www/sites/noschat.vodyanitsa.top/index
+  ARTIFACT: web-dist.tar.gz
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build (云端构建)
+        working-directory: web
+        # VITE_API_BASE_URL 留空 => 前端请求同源 /api，由 Nginx 反向代理到后端（无 CORS 问题）
+        # 如需前端直连其它域名：仓库 Settings → Secrets and variables → Actions → Variables
+        # 新增 VITE_API_BASE_URL（例如 https://api.example.com）
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: npm run build
+
+      - name: Package
+        working-directory: web
+        run: tar -czf "../${{ env.ARTIFACT }}" -C dist .
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat > ~/.ssh/config <<EOF
+          Host deploy
+            HostName $SERVER_HOST
+            User $SERVER_USER
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking accept-new
+            ServerAliveInterval 30
+          EOF
+
+      - name: Upload artifact (传到服务器)
+        run: |
+          ssh deploy "mkdir -p '${{ env.WEB_TARGET_DIR }}'"
+          scp -q "${{ env.ARTIFACT }}" deploy:"${{ env.WEB_TARGET_DIR }}/${{ env.ARTIFACT }}"
+
+      - name: Activate on server
+        run: |
+          ssh deploy "set -e
+            cd '${{ env.WEB_TARGET_DIR }}'
+            rm -rf dist && mkdir -p dist
+            tar -xzf '${{ env.ARTIFACT }}' -C dist
+            rm -f '${{ env.ARTIFACT }}'
+            echo '---- 部署完成，dist 内容：----'
+            ls -1 dist
+          "
+
+      - name: Summary
+        run: |
+          {
+            echo "### 前端部署完成 ✅"
+            echo ""
+            echo "- 产物目录：\`${{ env.WEB_TARGET_DIR }}/dist\`"
+            echo "- 提交：\`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

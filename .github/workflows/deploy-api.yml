@@ -1,0 +1,125 @@
+name: Deploy API (backend)
+
+# 触发：main 分支下 server/ 或 compose 配置有改动时自动部署；也可手动触发
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'docker-compose.yml'
+      - '.github/workflows/deploy-api.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api
+  cancel-in-progress: true
+
+env:
+  # 服务器上的后端目录（内含 docker-compose.yml 与 server/ 子目录）
+  BACKEND_DIR: /opt/noschat
+  IMAGE: noschat-api
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image (云端构建)
+        run: |
+          docker build \
+            --tag "$IMAGE:latest" \
+            --tag "$IMAGE:${{ github.sha }}" \
+            server/
+          docker image inspect "$IMAGE:latest" --format '镜像大小：{{.Size}} bytes'
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat > ~/.ssh/config <<EOF
+          Host deploy
+            HostName $SERVER_HOST
+            User $SERVER_USER
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking accept-new
+            ServerAliveInterval 30
+          EOF
+
+      - name: Transfer image (传到服务器)
+        run: |
+          echo "开始传输镜像（$(docker image inspect "$IMAGE:latest" --format '{{.Size}}') bytes）…"
+          docker save "$IMAGE:latest" | gzip -1 | ssh deploy 'docker load'
+
+      - name: Sync compose & backend source
+        # 只同步仓库中被跟踪的文件（server/.env 不在版本库中，服务器上的配置不会被覆盖）
+        run: |
+          tar -czf backend-src.tar.gz \
+            docker-compose.yml \
+            server/app \
+            server/config \
+            server/scripts \
+            server/tests \
+            server/Dockerfile \
+            server/.dockerignore \
+            server/requirements.txt \
+            server/run.py \
+            server/.env.example
+          ssh deploy "mkdir -p '${{ env.BACKEND_DIR }}'"
+          scp -q backend-src.tar.gz deploy:"${{ env.BACKEND_DIR }}/backend-src.tar.gz"
+          ssh deploy "set -e
+            cd '${{ env.BACKEND_DIR }}'
+            tar -xzf backend-src.tar.gz
+            rm -f backend-src.tar.gz
+            echo '---- 服务器上的 ${{ env.BACKEND_DIR }} ：----'
+            ls -1
+          "
+
+      - name: Restart service
+        run: |
+          ssh deploy "set -e
+            cd '${{ env.BACKEND_DIR }}'
+            if [ ! -f server/.env ]; then
+              echo '缺少 ${{ env.BACKEND_DIR }}/server/.env（后端唯一配置文件）'
+              echo '请在服务器上执行：cp server/.env.example server/.env 并填写 OPENAI_* / JWT_SECRET / SMTP_* / POSTGRES_* / MODEL_*'
+              exit 1
+            fi
+            docker compose up -d
+            docker compose ps
+          "
+
+      - name: Health check
+        run: |
+          ssh deploy 'for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:9135/health; then echo; echo "健康检查通过"; exit 0; fi
+            sleep 3
+          done
+          echo "健康检查失败，最近日志："
+          docker logs --tail 60 noschat-api
+          exit 1'
+
+      - name: Cleanup old images
+        continue-on-error: true
+        run: |
+          ssh deploy 'docker images --format "{{.Repository}}:{{.Tag}}" \
+            | grep "^${{ env.IMAGE }}:" | grep -v ":latest" | grep -v ":${{ github.sha }}" \
+            | xargs -r docker rmi || true
+            docker image prune -f'
+
+      - name: Summary
+        run: |
+          {
+            echo "### 后端部署完成 ✅"
+            echo ""
+            echo "- 镜像：\`${{ env.IMAGE }}:${{ github.sha }}\`（同时标记为 latest）"
+            echo "- 目录：\`${{ env.BACKEND_DIR }}\`"
+            echo "- 健康检查：\`http://127.0.0.1:9135/health\`"
+          } >> "$GITHUB_STEP_SUMMARY"

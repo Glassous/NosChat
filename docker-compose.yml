@@ -52,7 +52,8 @@ services:
       POSTGRES_HOST: db
       MODELS_CONFIG_PATH: config/models.json
     ports:
-      - "9135:9135"
+      # 仅监听本机，由反向代理（Nginx / 1Panel OpenResty）对外提供访问
+      - "127.0.0.1:9135:9135"
     volumes:
       # 挂载模型清单：修改 server/config/models.json 后 docker compose restart api 即可生效
       - ./server/config:/app/config:ro
