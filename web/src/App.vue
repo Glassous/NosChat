@@ -1,5 +1,9 @@
 <template>
-  <div class="app-container">
+  <!-- 用户未登录时显示认证页面 -->
+  <AuthPage v-if="!isAuthenticated" @success="handleAuthSuccess" />
+
+  <!-- 用户已登录时显示主聊天界面 -->
+  <div v-else class="app-container">
     <header class="app-header">
       <div class="header-left">
         <button
@@ -12,15 +16,28 @@
         </button>
         <div class="logo">
           <div class="logo-icon">🤖</div>
-          <h1>NosChat</h1>
-          <span class="tagline">AI 智能聊天助手</span>
+          <div class="logo-text">
+            <h1>NosChat</h1>
+            <span class="tagline">欢迎回来，{{ currentUser?.nickname || currentUser?.username }}</span>
+          </div>
         </div>
       </div>
 
       <div class="header-right">
+        <div class="user-info">
+          <div class="user-avatar">
+            {{ getAvatarInitial(currentUser?.nickname || currentUser?.username) }}
+          </div>
+          <div class="user-details">
+            <span class="user-nickname">{{ currentUser?.nickname || currentUser?.username }}</span>
+            <button @click="handleLogout" class="logout-btn" title="退出登录">
+              退出
+            </button>
+          </div>
+        </div>
         <div class="status-indicator">
           <span class="status-dot connected"></span>
-          <span class="status-text">离线模式</span>
+          <span class="status-text">已登录 · 离线模式</span>
         </div>
       </div>
     </header>
@@ -112,8 +129,8 @@
     </main>
 
     <footer class="app-footer">
-      <p>© 2024 NosChat - 基于 AI 的智能聊天应用演示</p>
-      <p class="disclaimer">注意：当前为演示版本，回复内容由本地模拟数据生成，未接入真实模型</p>
+      <p>© 2024 NosChat - AI 智能聊天助手</p>
+      <p class="disclaimer">用户：{{ currentUser?.username }} | 昵称：{{ currentUser?.nickname }}</p>
     </footer>
 
     <!-- 删除确认弹窗 -->
@@ -146,8 +163,14 @@ import ChatSidebar from './components/ChatSidebar.vue'
 import ChatMessages from './components/ChatMessages.vue'
 import ChatInput from './components/ChatInput.vue'
 import ModelSelector from './components/ModelSelector.vue'
+import AuthPage from './components/AuthPage.vue'
 import { MODEL_LIST, MOCK_CONVERSATIONS, MOCK_MESSAGES, getModel, mockReply } from './data/models.js'
+import { useAuth } from './stores/userStore.js'
 
+// 用户认证状态
+const { isAuthenticated, currentUser, logout: authLogout } = useAuth()
+
+// 聊天应用状态
 const conversations = ref(
   MOCK_CONVERSATIONS.map(c => ({
     ...c,
@@ -165,14 +188,14 @@ const pendingDelete = ref(null)
 const toast = ref('')
 const selectedModelId = ref(localStorage.getItem('noschat.model') || MODEL_LIST[0].id)
 
-// 深度思考区块的默认展开状态（逐条点击只影响当前消息）
+// 深度思考区块的默认展开状态
 const thinkDefaultOpen = ref(localStorage.getItem('noschat.thinkOpen') === '1')
 watch(thinkDefaultOpen, value => localStorage.setItem('noschat.thinkOpen', value ? '1' : '0'))
 
 let seq = 0
 const uid = () => `${Date.now()}-${++seq}`
 
-// 当前流式回复的定时器（模拟「先思考、再回答」的打字过程）
+// 当前流式回复的定时器
 let streamTimer = null
 const streamConversationId = ref('')
 
@@ -242,7 +265,7 @@ function createNewConversation() {
       id: uid(),
       type: 'ai',
       model: selectedModelId.value,
-      content: `你好！当前模型是 ${currentModel.value.name}（${currentModel.value.provider}）。这是一次全新对话，有什么可以帮你的吗？`,
+      content: `你好，${currentUser.value?.nickname || '朋友'}！当前模型是 ${currentModel.value.name}。有什么可以帮你的吗？`,
       timestamp: nowTime()
     }
   ]
@@ -302,7 +325,7 @@ function sendMessage() {
   if (conversation) {
     conversation.preview = previewOf(content)
     conversation.timestamp = '刚刚'
-    // 首次提问时用问题内容自动命名，避免一堆「新对话」
+    // 首次提问时用问题内容自动命名
     if (conversation.title === '新对话') {
       conversation.title = content.length > 16 ? content.slice(0, 16) + '…' : content
     }
@@ -315,7 +338,7 @@ function sendMessage() {
   const [min, max] = reply.latency
   const total = min + Math.random() * (max - min)
 
-  // 有深度思考的模型：先逐字吐思考，再逐字吐结论（约 60% 时间用于思考）
+  // 有深度思考的模型：先逐字吐思考，再逐字吐结论
   const TICK = 50
   const thinkMs = reply.thinking ? total * 0.6 : 0
   const answerMs = Math.max(TICK, total - thinkMs)
@@ -385,6 +408,21 @@ function onModelChange(model) {
   showToast(`已切换到 ${model.name}`)
 }
 
+function handleAuthSuccess() {
+  showToast('登录成功！')
+  // 可以在这里添加其他登录成功后的逻辑
+}
+
+function handleLogout() {
+  authLogout()
+  showToast('已退出登录')
+}
+
+function getAvatarInitial(name) {
+  if (!name) return '?'
+  return name.charAt(0).toUpperCase()
+}
+
 watch(activeConversationId, () => {
   sidebarOpen.value = false
 })
@@ -402,7 +440,7 @@ function onViewportChange(e) {
 
 onMounted(() => {
   mql?.addEventListener('change', onViewportChange)
-  console.log('NosChat AI 聊天应用已启动')
+  console.log('NosChat AI 聊天应用已启动', { isAuthenticated: isAuthenticated.value })
 })
 
 onBeforeUnmount(() => {
@@ -439,6 +477,58 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 0.75rem;
   min-width: 0;
+}
+
+.user-info {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 0.3rem 0.75rem 0.3rem 0.3rem;
+  border-radius: 999px;
+}
+
+.user-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: white;
+  display: grid;
+  place-items: center;
+  font-weight: bold;
+  font-size: 0.9rem;
+}
+
+.user-details {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.user-nickname {
+  color: white;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.logout-btn {
+  background: rgba(255, 255, 255, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.9);
+  padding: 0.2rem 0.5rem;
+  border-radius: 0.5rem;
+  font-size: 0.7rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.logout-btn:hover {
+  background: rgba(255, 255, 255, 0.25);
+  border-color: rgba(255, 255, 255, 0.35);
 }
 
 .menu-toggle {
@@ -488,6 +578,12 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
+.logo-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
 .logo-icon {
   font-size: clamp(1.3rem, 3vw, 2rem);
   animation: pulse 2s infinite;
@@ -508,8 +604,7 @@ onBeforeUnmount(() => {
 
 .tagline {
   color: rgba(255, 255, 255, 0.8);
-  font-size: 0.9rem;
-  margin-left: 0.5rem;
+  font-size: 0.8rem;
   white-space: nowrap;
 }
 
@@ -535,7 +630,7 @@ onBeforeUnmount(() => {
 
 .status-text {
   color: white;
-  font-size: 0.875rem;
+  font-size: 0.85rem;
   white-space: nowrap;
 }
 
@@ -905,6 +1000,16 @@ onBeforeUnmount(() => {
   .status-indicator {
     padding: 0.4rem 0.6rem;
   }
+  
+  .user-info {
+    padding: 0.2rem 0.5rem 0.2rem 0.2rem;
+  }
+  
+  .user-details {
+    flex-direction: column;
+    gap: 0.2rem;
+    align-items: flex-start;
+  }
 }
 
 .drawer-enter-active,
@@ -922,6 +1027,10 @@ onBeforeUnmount(() => {
   .logo { gap: 0.5rem; }
   .header-left { gap: 0.5rem; }
   .app-footer .disclaimer { display: none; }
+  
+  .user-info {
+    display: none;
+  }
 }
 
 @media (max-width: 640px) {
