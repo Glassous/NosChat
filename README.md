@@ -169,19 +169,34 @@ python tests/mock_llm.py             # 127.0.0.1:9901
 
 ### 服务器一次性准备
 
-```bash
-# 后端目录（CI 会把 docker-compose.yml 与 server/ 源码同步过来，但不会覆盖 .env）
-mkdir -p /opt/noschat/server
-cd /opt/noschat
-cp server/.env.example server/.env     # CI 首次同步后该文件才存在；也可手动创建
-vi server/.env                         # 填 OPENAI_* / JWT_SECRET / SMTP_* / POSTGRES_* / MODEL_*
-# 容器内的 POSTGRES_HOST 由 compose 覆盖为 db，这里保持 localhost 即可
+在服务器上以 root（或 `sudo`）执行一次，把两个部署目录的属主交给 `SERVER_USER`（否则会报 `Permission denied`）：
 
-# 前端目录（1Panel 站点目录）
-mkdir -p /opt/1panel/www/sites/noschat.vodyanitsa.top/index/dist
+```bash
+USER=<SERVER_USER>          # 换成你在 Secret 里填的 SSH 用户名
+
+# 1) 后端目录（CI 会同步 docker-compose.yml 与 server/ 源码，但不会覆盖 .env）
+sudo mkdir -p /opt/noschat/server
+sudo chown -R "$USER":"$USER" /opt/noschat
+sudo chmod -R u+rwX,go+rX /opt/noschat
+
+# 2) 前端站点目录（1Panel 站点目录；nginx 以 www 用户读取，保留 go+r 权限）
+sudo mkdir -p /opt/1panel/www/sites/noschat.vodyanitsa.top/index/dist
+sudo chown -R "$USER":"$USER" /opt/1panel/www/sites/noschat.vodyanitsa.top/index
+sudo chmod -R u+rwX,go+rX /opt/1panel/www/sites/noschat.vodyanitsa.top/index
+
+# 3) 允许该用户使用 Docker（CI 需要 docker load / compose）
+#    执行后重新登录 SSH（或重连会话）让 docker 组生效
+sudo usermod -aG docker "$USER"
+
+# 4) 后端唯一配置文件（不会被 CI 覆盖，部署前必须存在）
+#    首次可先手动创建，内容参考仓库中的 server/.env.example
+sudo -u "$USER" vi /opt/noschat/server/.env
 ```
 
-> 服务器上需要已安装 Docker（含 compose 插件）；`/opt/noschat/server/.env` 不会被 CI 覆盖，首次部署前必须先准备好。
+> - 服务器需已安装 Docker（含 compose 插件）。
+> - `POSTGRES_HOST` 在容器内由 compose 覆盖为服务名 `db`，`.env` 里保持 `localhost` 即可。
+> - 若之后在 1Panel 里重新保存了站点设置导致目录属主变回 root，重新执行第 2 步的 `chown` 即可。
+> - 两个工作流都带**前置自检**：权限或 Docker 不可用时会直接打印上面这些修复命令后退出，不会跑到一半才失败。
 
 ### 反向代理（1Panel 面板创建）
 

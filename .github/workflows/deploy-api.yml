@@ -54,6 +54,30 @@ jobs:
             ServerAliveInterval 30
           EOF
 
+      - name: Preflight (目录写权限 + Docker 可用性自检)
+        run: |
+          ssh deploy bash -s <<'REMOTE'
+          set -u
+          DIR="${{ env.BACKEND_DIR }}"
+          if ! mkdir -p "$DIR" 2>/dev/null || [ ! -w "$DIR" ]; then
+            echo "❌ 当前 SSH 用户对目标目录没有写权限：$DIR"
+            echo "请在服务器上以 root 执行一次（把目录属主改成部署用户）："
+            echo "  mkdir -p \"$DIR\" && chown -R $(id -un):$(id -gn) \"$DIR\""
+            echo "或者把仓库 Secret 里的 SERVER_USER 换成有权限的账号（如 root，需允许 SSH 登录）"
+            exit 1
+          fi
+          if ! docker info >/dev/null 2>&1; then
+            echo "❌ 当前 SSH 用户无法访问 Docker（socket 权限）"
+            echo "请在服务器上以 root 执行一次："
+            echo "  usermod -aG docker $(id -un)   # 之后重新登录/重连 SSH 使组生效"
+            exit 1
+          fi
+          docker compose version >/dev/null 2>&1 || {
+            echo "⚠️ 未检测到 docker compose 插件（部分老版本为 docker-compose），请确认服务器已安装"
+          }
+          echo "✅ 目录可写且 Docker 可用：$DIR"
+          REMOTE
+
       - name: Transfer image (传到服务器)
         run: |
           echo "开始传输镜像（$(docker image inspect "$IMAGE:latest" --format '{{.Size}}') bytes）…"

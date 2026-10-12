@@ -69,9 +69,23 @@ jobs:
             ServerAliveInterval 30
           EOF
 
+      - name: Preflight (部署目录写权限自检)
+        run: |
+          ssh deploy bash -s <<'REMOTE'
+          set -u
+          TARGET="${{ env.WEB_TARGET_DIR }}"
+          if ! mkdir -p "$TARGET" 2>/dev/null || [ ! -w "$TARGET" ]; then
+            echo "❌ 当前 SSH 用户对目标目录没有写权限：$TARGET"
+            echo "请在服务器上以 root 执行一次（把目录属主改成部署用户）："
+            echo "  mkdir -p \"$TARGET\" && chown -R $(id -un):$(id -gn) \"$TARGET\""
+            echo "或者把仓库 Secret 里的 SERVER_USER 换成有权限的账号（如 root，需允许 SSH 登录）"
+            exit 1
+          fi
+          echo "✅ 目标目录可写：$TARGET"
+          REMOTE
+
       - name: Upload artifact (传到服务器)
         run: |
-          ssh deploy "mkdir -p '${{ env.WEB_TARGET_DIR }}'"
           scp -q "${{ env.ARTIFACT }}" deploy:"${{ env.WEB_TARGET_DIR }}/${{ env.ARTIFACT }}"
 
       - name: Activate on server
