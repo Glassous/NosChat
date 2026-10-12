@@ -118,9 +118,11 @@ def main() -> None:
             _fail(f"新建会话失败：{created.status_code} {created.text}")
         payload = created.json()
         conversation_id = payload["conversation"]["id"]
-        if len(payload["messages"]) != 1 or payload["messages"][0]["type"] != "ai":
-            _fail(f"欢迎消息异常：{payload['messages']}")
-        _ok(f"新建会话：{conversation_id} 欢迎语={payload['messages'][0]['content'][:24]}…")
+        if payload["messages"]:
+            _fail(f"新会话不应包含开场白消息：{payload['messages']}")
+        if payload["conversation"]["preview"] != "开始新的对话…":
+            _fail(f"新会话预览异常：{payload['conversation']['preview']}")
+        _ok(f"新建会话：{conversation_id}（无开场白，预览={payload['conversation']['preview']}）")
 
         # 8. 流式对话
         thinking, content, done = [], [], False
@@ -159,8 +161,8 @@ def main() -> None:
         # 9. 消息落库
         messages = client.get(f"{api}/conversations/{conversation_id}/messages", headers=auth)
         rows = messages.json()
-        if len(rows) != 3:
-            _fail(f"消息数量异常（期望 3）：{len(rows)}")
+        if len(rows) != 2:
+            _fail(f"消息数量异常（期望 2：用户 + 助手，无开场白）：{len(rows)}")
         assistant = rows[-1]
         if assistant["type"] != "ai" or not assistant["content"]:
             _fail(f"助手消息落库异常：{assistant}")

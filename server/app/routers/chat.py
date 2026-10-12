@@ -41,6 +41,8 @@ GREETING_PREVIEW = "开始新的对话…"
 HISTORY_LIMIT = 20
 _PREVIEW_LIMIT = 34
 _TITLE_LIMIT = 16
+# 早期版本会为每个新会话写入一条开场白，这里在读取时忽略它（界面与上游上下文都不再出现）
+_LEGACY_GREETING = re.compile(r"^你好，.+！当前模型是 .+。有什么可以帮你的吗？$")
 
 
 # ---------------------------------------------------------------- 辅助
@@ -64,8 +66,13 @@ def _derive_title(text: str) -> str:
     return one[: _TITLE_LIMIT] + "…" if len(one) > _TITLE_LIMIT else one
 
 
-def _greeting(nickname: str, model_name: str) -> str:
-    return f"你好，{nickname or '朋友'}！当前模型是 {model_name}。有什么可以帮你的吗？"
+def _drop_legacy_greeting(rows: list[Message]) -> list[Message]:
+    """去掉历史遗留的开场白（会话的第一条助手消息）。"""
+    if rows and rows[0].role == "assistant":
+        first = (rows[0].content or "").strip()
+        if _LEGACY_GREETING.match(first):
+            return rows[1:]
+    return rows
 
 
 def _sse(payload: dict) -> str:
@@ -93,7 +100,7 @@ async def _load_messages(
         stmt = stmt.limit(limit)
     rows = list((await db.scalars(stmt)).all())
     rows.reverse()
-    return rows
+    return _drop_legacy_greeting(rows)
 
 
 async def _save_assistant_message(
@@ -145,7 +152,7 @@ async def list_conversations(
     "/conversations",
     response_model=ConversationCreated,
     status_code=status.HTTP_201_CREATED,
-    summary="新建会话（含欢迎消息）",
+    summary="新建会话",
 )
 async def create_conversation(
     payload: CreateConversationRequest,
@@ -156,6 +163,7 @@ async def create_conversation(
     if model is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "服务端未配置任何模型")
 
+    # 新会话不写入开场白消息：避免干扰界面阅读与上游上下文
     conversation = Conversation(
         user_id=user.id,
         title=(payload.title or GREETING_TITLE).strip() or GREETING_TITLE,
@@ -163,23 +171,10 @@ async def create_conversation(
         preview=GREETING_PREVIEW,
     )
     db.add(conversation)
-    await db.flush()
-
-    greeting = Message(
-        conversation_id=conversation.id,
-        role="assistant",
-        model_id=model["id"],
-        content=_greeting(user.nickname, model["name"]),
-    )
-    db.add(greeting)
     await db.commit()
     await db.refresh(conversation)
-    await db.refresh(greeting)
 
-    return ConversationCreated(
-        conversation=conversation_out(conversation),
-        messages=[message_out(greeting)],
-    )
+    return ConversationCreated(conversation=conversation_out(conversation), messages=[])
 
 
 @router.get(
