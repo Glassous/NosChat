@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -95,8 +97,10 @@ class Conversation(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+    # 注意：这里刻意不加 onupdate —— 更新 updated_at 的时机由业务代码显式决定
+    # （标记已读等操作不应把会话顶到列表顶部、也不应把时间戳变成「刚刚」）
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+        DateTime(timezone=True), default=utcnow, nullable=False
     )
 
     user: Mapped[User] = relationship(back_populates="conversations")
@@ -131,4 +135,33 @@ class Message(Base):
 
     __table_args__ = (
         Index("ix_messages_conversation_created", "conversation_id", "created_at"),
+    )
+
+
+class DailyUsage(Base):
+    """每用户每日的模型输出 token 用量（额度按 QUOTA_TIMEZONE 的自然日切分）。
+
+    只累计输出 token（thinking + content），输入 token 不计。
+    该表是额度判定的唯一权威来源；Redis 只做快照缓存。
+    """
+
+    __tablename__ = "daily_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    day: Mapped[date] = mapped_column(Date, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
+    requests: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "day", name="uq_daily_usage_user_day"),
     )

@@ -7,11 +7,12 @@ import math
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import ratelimit
 from ..config import get_settings
 from ..database import get_db
 from ..deps import get_current_user
@@ -97,6 +98,29 @@ async def _latest_code(
     return await db.scalar(stmt)
 
 
+async def _guard_email(
+    request: Request, scope: str, email: str, limit: int, window: int
+) -> None:
+    """账号维度 + IP 维度的双重限流（账号维度是暴力破解的主防线）。
+
+    用于登录 / 验证码登录 / 重置密码：同一邮箱在窗口内尝试次数受限，
+    同时用登录 IP 阈值兜住"换邮箱撞库"的场景。
+    """
+    settings = get_settings()
+    await ratelimit.enforce(scope, ratelimit.email_identity(email), limit, window)
+    await ratelimit.enforce(
+        f"{scope}-ip",
+        ratelimit.client_ip(request),
+        settings.login_rate_limit_per_ip,
+        settings.login_rate_limit_window_seconds,
+    )
+
+
+async def _guard_ip(request: Request, scope: str, limit: int, window: int) -> None:
+    """仅按 IP 限流（用于发码 / 注册这类没有账号可归因的入口）。"""
+    await ratelimit.enforce(scope, ratelimit.client_ip(request), limit, window)
+
+
 async def _consume_code(db: AsyncSession, email: str, purpose: str, code: str) -> None:
     """校验验证码并标记为已使用；失败时抛出 HTTPException。
 
@@ -130,6 +154,7 @@ async def _consume_code(db: AsyncSession, email: str, purpose: str, code: str) -
 @router.post("/send-code", response_model=SendCodeResponse, summary="发送邮箱验证码")
 async def send_code(
     payload: SendCodeRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> SendCodeResponse:
     """按用途发送验证码：register 注册 / login 验证码登录 / reset 找回密码。
@@ -141,6 +166,13 @@ async def send_code(
     settings = get_settings()
     email = _normalize_email(payload.email)
     purpose = payload.purpose
+
+    await _guard_ip(
+        request,
+        "send-code",
+        settings.send_code_rate_limit_per_ip,
+        settings.send_code_rate_limit_window_seconds,
+    )
 
     user_exists = await db.scalar(select(User.id).where(User.email == email)) is not None
     if purpose == PURPOSE_REGISTER and user_exists:
@@ -209,9 +241,18 @@ async def send_code(
 )
 async def register(
     payload: RegisterRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
     email = _normalize_email(payload.email)
+    settings = get_settings()
+
+    await _guard_ip(
+        request,
+        "register",
+        settings.register_rate_limit_per_ip,
+        settings.register_rate_limit_window_seconds,
+    )
 
     if await db.scalar(select(User.id).where(User.email == email)) is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "该邮箱已注册，请直接登录")
@@ -234,9 +275,21 @@ async def register(
 @router.post("/login", response_model=TokenResponse, summary="邮箱密码登录")
 async def login(
     payload: LoginRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
+    settings = get_settings()
     email = _normalize_email(payload.email)
+
+    # 限流先于密码校验：暴力破解在触碰数据库比对之前就被挡下
+    await _guard_email(
+        request,
+        "login",
+        email,
+        settings.login_rate_limit_per_email,
+        settings.login_rate_limit_window_seconds,
+    )
+
     user = await db.scalar(select(User).where(User.email == email))
 
     if user is None or not verify_password(payload.password, user.hashed_password):
@@ -254,9 +307,20 @@ async def login(
 )
 async def login_with_code(
     payload: CodeLoginRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
+    settings = get_settings()
     email = _normalize_email(payload.email)
+
+    await _guard_email(
+        request,
+        "login-code",
+        email,
+        settings.login_rate_limit_per_email,
+        settings.login_rate_limit_window_seconds,
+    )
+
     await _consume_code(db, email, PURPOSE_LOGIN, payload.code)
 
     user = await db.scalar(select(User).where(User.email == email))
@@ -304,9 +368,20 @@ async def login_with_code(
 )
 async def reset_password(
     payload: ResetPasswordRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
+    settings = get_settings()
     email = _normalize_email(payload.email)
+
+    await _guard_email(
+        request,
+        "reset",
+        email,
+        settings.login_rate_limit_per_email,
+        settings.login_rate_limit_window_seconds,
+    )
+
     user = await db.scalar(select(User).where(User.email == email))
 
     if user is None:
@@ -323,6 +398,27 @@ async def reset_password(
 
     logger.info("密码已重置：%s", email)
     return _token_response(user)
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="退出登录（撤销该账号此前签发的全部令牌）",
+)
+async def logout(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """登出。
+
+    令牌版本号 +1，使该账号**此前签发的所有访问令牌立即失效**（含其它设备）。
+    这是无状态 JWT 下不引入黑名单即可做到服务端撤销的最简方式；
+    代价是多设备需各自重新登录。
+    """
+    user.token_version += 1
+    await db.commit()
+    logger.info("用户已登出，旧令牌全部失效：%s", user.email)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/me", response_model=UserOut, summary="当前登录用户")

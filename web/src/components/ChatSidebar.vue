@@ -51,7 +51,7 @@
                 v-model="editingTitle"
                 class="title-edit-input"
                 type="text"
-                maxlength="30"
+                maxlength="60"
                 aria-label="修改对话标题"
                 @keydown.enter="saveEditTitle(conversation.id)"
                 @keydown.esc="cancelEdit"

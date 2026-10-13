@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import ratelimit, usage
 from ..config import get_settings
 from ..database import SessionLocal, get_db
 from ..deps import get_current_user
@@ -205,22 +206,29 @@ async def update_conversation(
 ) -> ConversationOut:
     conversation = await _get_conversation(db, user, conversation_id)
 
+    touched = False
     if payload.title is not None:
         title = payload.title.strip()
         if not title:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "标题不能为空")
         conversation.title = title
+        touched = True
     if payload.model is not None:
         model = registry.get(payload.model)
         if model is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "模型不存在或未配置")
         conversation.model_id = model["id"]
+        touched = True
     if payload.pinned is not None:
         conversation.pinned = payload.pinned
+        touched = True
     if payload.unread is not None:
+        # 标记已读不属于「会话内容变化」：不推高 updated_at，
+        # 否则会话会被顶到列表顶部、时间戳也会变成「刚刚」
         conversation.unread = payload.unread
 
-    conversation.updated_at = utcnow()
+    if touched:
+        conversation.updated_at = utcnow()
     await db.commit()
     await db.refresh(conversation)
     return conversation_out(conversation)
@@ -262,6 +270,17 @@ async def chat_stream(
 
     conversation = await _get_conversation(db, user, payload.conversation_id)
 
+    # 限流与额度闸门都放在写入用户消息之前：被拒绝的请求不落库、也不产生用量
+    await ratelimit.enforce(
+        "chat",
+        f"u:{user.id}",
+        settings.chat_rate_limit_per_user,
+        settings.chat_rate_limit_window_seconds,
+    )
+    # 额度只按 JWT 解析出的 user.id 判定，客户端无法用请求体绕过；
+    # 判定通过则整轮放行（允许把用量推过上限，以保证回复完整）
+    await usage.ensure_within_quota(db, user.id)
+
     # 1) 先落库用户消息，并同步会话标题/预览/模型
     user_message = Message(
         conversation_id=conversation.id,
@@ -297,6 +316,9 @@ async def chat_stream(
     upstream_name = model["model"]
     temperature = model.get("temp")
     base_url = model.get("base_url")
+    user_id = user.id
+    # 上游上报的用量落到这里（网关不支持时为空，改用字符估算）
+    usage_sink: dict[str, int] = {}
 
     async def event_stream() -> AsyncIterator[str]:
         thinking_parts: list[str] = []
@@ -305,6 +327,8 @@ async def chat_stream(
         think_elapsed = 0.0
         error_message: str | None = None
         assistant_id: str | None = None
+        final_thinking_sec = 0
+        usage_payload: dict = {}
         final_preview = preview
 
         yield _sse(
@@ -323,6 +347,7 @@ async def chat_stream(
                 messages=upstream_messages,
                 temperature=temperature,
                 base_url=base_url,
+                usage_sink=usage_sink,
             ):
                 if kind == "thinking":
                     if think_started is None:
@@ -349,6 +374,29 @@ async def chat_stream(
             final_thinking = "".join(thinking_parts)
             if think_started is not None and think_elapsed <= 0:
                 think_elapsed = max(1.0, time.monotonic() - think_started)
+            # 思考耗时以服务端测量为准（前端不再自行计算）
+            final_thinking_sec = int(round(think_elapsed)) if final_thinking else 0
+
+            # 额度记账：只统计输出 token（thinking + content），输入不计
+            upstream_tokens = usage_sink.get("completion_tokens")
+            estimated = upstream_tokens is None
+            counted = (
+                usage.estimate_output_tokens(final_thinking + final_content)
+                if estimated
+                else int(upstream_tokens or 0)
+            )
+            try:
+                await usage.add_output_tokens(user_id, counted)
+            except Exception:  # noqa: BLE001 - 记账失败不应影响已返回内容
+                logger.exception("输出 token 记账失败（conversation=%s）", conversation_id)
+            try:
+                usage_payload = {
+                    **(await usage.get_usage(db, user_id)).as_dict(),
+                    "estimated": estimated,
+                }
+            except Exception:  # noqa: BLE001 - 快照读取失败不阻塞收尾
+                logger.exception("额度快照读取失败（user=%s）", user_id)
+
             if final_content or final_thinking:
                 try:
                     saved = await _save_assistant_message(
@@ -356,7 +404,7 @@ async def chat_stream(
                         model_id=model_id,
                         content=final_content,
                         thinking=final_thinking,
-                        thinking_sec=int(round(think_elapsed)),
+                        thinking_sec=final_thinking_sec,
                     )
                     assistant_id = saved.id
                     if final_content:
@@ -371,6 +419,8 @@ async def chat_stream(
                     "message": error_message,
                     "conversationId": conversation_id,
                     "messageId": assistant_id,
+                    "thinkingSec": final_thinking_sec,
+                    "usage": usage_payload,
                 }
             )
             return
@@ -382,6 +432,8 @@ async def chat_stream(
                 "messageId": assistant_id,
                 "title": title,
                 "preview": final_preview,
+                "thinkingSec": final_thinking_sec,
+                "usage": usage_payload,
             }
         )
 

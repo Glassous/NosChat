@@ -1,6 +1,14 @@
 <template>
   <div class="chat-input">
-    <div v-if="model" class="input-model-bar">
+    <!-- 额度用尽：后端会直接拒绝请求，这里同步锁定输入并说明重置时间 -->
+    <div v-if="quotaExceeded" class="quota-bar" role="status">
+      <span class="quota-ic">🔒</span>
+      <span class="quota-text">
+        今日输出 token 已达上限（{{ quotaLimitText }}），将于 {{ quotaResetLabel || '次日' }} 重置
+      </span>
+    </div>
+
+    <div v-else-if="model" class="input-model-bar">
       <span class="im-avatar" :style="{ background: model.color }">{{ model.icon }}</span>
       <span class="im-name">{{ model.name }}</span>
       <span class="im-tags">
@@ -13,17 +21,17 @@
 
     <div class="input-container">
       <div class="input-actions">
-        <button class="action-btn" title="附加文件" aria-label="附加文件">📎</button>
-        <button class="action-btn" title="表情符号" aria-label="表情符号">😊</button>
+        <button class="action-btn" title="附加文件" aria-label="附加文件" :disabled="quotaExceeded">📎</button>
+        <button class="action-btn" title="表情符号" aria-label="表情符号" :disabled="quotaExceeded">😊</button>
       </div>
 
       <div class="input-wrapper">
         <textarea
           ref="textareaRef"
           v-model="localValue"
-          :placeholder="placeholder"
+          :placeholder="placeholderText"
           :disabled="disabled"
-          maxlength="1000"
+          maxlength="4000"
           rows="1"
           class="message-textarea"
           aria-label="消息输入框"
@@ -34,7 +42,7 @@
         <div class="input-hints">
           <span class="hint-text desktop-only">按 Enter 发送，Shift + Enter 换行</span>
           <span class="hint-text mobile-only">点击右下角发送</span>
-          <span class="char-count" :class="countClass">{{ localValue.length }}/1000</span>
+          <span class="char-count" :class="countClass">{{ localValue.length }}/4000</span>
         </div>
       </div>
 
@@ -53,7 +61,7 @@
       </div>
     </div>
 
-    <div v-if="showQuickActions" class="quick-actions">
+    <div v-if="showQuickActions && !quotaExceeded" class="quick-actions">
       <button class="quick-action-btn" @click="insertSuggestion('你好！')">👋 打招呼</button>
       <button class="quick-action-btn" @click="insertSuggestion('谢谢！')">🙏 表示感谢</button>
       <button class="quick-action-btn" @click="insertSuggestion('请详细说明')">💡 请求解释</button>
@@ -85,6 +93,20 @@ const props = defineProps({
   model: {
     type: Object,
     default: null
+  },
+  // 当日输出 token 额度是否已用尽（由后端判定，前端只做锁定与提示）
+  quotaExceeded: {
+    type: Boolean,
+    default: false
+  },
+  quotaLimit: {
+    type: Number,
+    default: 0
+  },
+  // 后端给出的重置时刻文案（已按其时区格式化）
+  quotaResetLabel: {
+    type: String,
+    default: ''
   }
 })
 
@@ -94,14 +116,30 @@ const textareaRef = ref(null)
 const localValue = ref(props.modelValue)
 const showQuickActions = ref(true)
 
+// 单条消息上限与后端 ChatStreamRequest.content max_length 保持一致
+const MAX_LENGTH = 4000
+
+const quotaLimitText = computed(() =>
+  props.quotaLimit > 0 ? props.quotaLimit.toLocaleString('en-US') : '已用尽'
+)
+
+/** 额度用尽时给出明确原因，而不是笼统的禁用态 */
+const placeholderText = computed(() => {
+  if (!props.quotaExceeded) return props.placeholder
+  return props.quotaResetLabel
+    ? `今日输出 token 已达上限，将于 ${props.quotaResetLabel} 重置`
+    : '今日输出 token 已达上限，请等待重置'
+})
+
 const canSend = computed(() => {
-  return localValue.value.trim().length > 0 && localValue.value.length <= 1000
+  if (props.quotaExceeded) return false
+  return localValue.value.trim().length > 0 && localValue.value.length <= MAX_LENGTH
 })
 
 const countClass = computed(() => {
   const len = localValue.value.length
-  if (len >= 1000) return 'error'
-  if (len >= 850) return 'warning'
+  if (len >= MAX_LENGTH) return 'error'
+  if (len >= MAX_LENGTH * 0.85) return 'warning'
   return ''
 })
 
@@ -194,6 +232,30 @@ onMounted(() => {
   color: #64748b;
 }
 
+/* 额度用尽提示条：替换模型信息条位置，保持输入区高度稳定 */
+.quota-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 0.6rem;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  color: #92400e;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.quota-ic {
+  flex: 0 0 auto;
+  font-size: 0.85rem;
+}
+
+.quota-text {
+  min-width: 0;
+}
+
 .im-avatar {
   width: 20px;
   height: 20px;
@@ -277,6 +339,11 @@ onMounted(() => {
 .action-btn:hover {
   background: #f1f5f9;
   border-color: #cbd5e1;
+}
+
+.action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .input-wrapper {

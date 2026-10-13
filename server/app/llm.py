@@ -122,18 +122,39 @@ def _content_delta(delta: Any) -> str:
     return ""
 
 
+def _completion_tokens(chunk: Any) -> int | None:
+    """从流式块里取上游上报的输出 token 数（多数网关只在最后一块给）。"""
+    usage = getattr(chunk, "usage", None)
+    if usage is None:
+        return None
+    for attr in ("completion_tokens", "output_tokens"):
+        value = getattr(usage, attr, None)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return None
+
+
 async def stream_chat(
     *,
     model: str,
     messages: list[dict[str, str]],
     temperature: float | None = None,
     base_url: str | None = None,
+    usage_sink: dict[str, int] | None = None,
 ) -> AsyncIterator[tuple[str, str]]:
-    """流式调用上游模型，逐块产出 ("thinking" | "content", delta)。"""
+    """流式调用上游模型，逐块产出 ("thinking" | "content", delta)。
+
+    用量上报（可选）：上游若在流中返回 usage，会写入 usage_sink["completion_tokens"]，
+    供调用方做每日输出 token 记账；网关不上报时该键保持不存在，由调用方回退估算。
+    """
+    settings = get_settings()
     client = get_client(base_url)
     payload: dict[str, Any] = {"model": model, "messages": messages, "stream": True}
     if temperature is not None:
         payload["temperature"] = temperature
+    if settings.openai_stream_usage:
+        # 部分第三方网关不认该参数，因此默认关闭；开启后若被拒会按坏请求处理
+        payload["stream_options"] = {"include_usage": True}
 
     try:
         stream = await client.chat.completions.create(**payload)
@@ -143,6 +164,10 @@ async def stream_chat(
 
     try:
         async for chunk in stream:
+            if usage_sink is not None:
+                tokens = _completion_tokens(chunk)
+                if tokens is not None:
+                    usage_sink["completion_tokens"] = tokens
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue

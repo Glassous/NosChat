@@ -1,6 +1,14 @@
 <template>
+  <!-- 本地存在令牌但尚未由后端确认：显示校验态，避免闪现已登录界面 -->
+  <div v-if="authToken && !sessionReady" class="app-boot">
+    <div class="boot-card">
+      <div class="boot-spinner"></div>
+      <p>正在校验登录状态…</p>
+    </div>
+  </div>
+
   <!-- 用户未登录时显示认证页面 -->
-  <AuthPage v-if="!isAuthenticated" @success="handleAuthSuccess" />
+  <AuthPage v-else-if="!isAuthenticated" @success="handleAuthSuccess" />
 
   <!-- 用户已登录时显示主聊天界面 -->
   <div v-else class="app-container">
@@ -124,9 +132,12 @@
           <ChatInput
             v-model="inputMessage"
             @send="sendMessage"
-            :disabled="isLoading"
+            :disabled="isLoading || quotaExceeded"
             :loading="isLoading"
             :model="currentModel"
+            :quota-exceeded="quotaExceeded"
+            :quota-limit="quota.limit"
+            :quota-reset-label="quotaResetLabel"
           />
         </div>
       </div>
@@ -202,6 +213,7 @@ import ModelSelector from './components/ModelSelector.vue'
 import AuthPage from './components/AuthPage.vue'
 import { MODEL_LIST, getModel, setModels } from './data/models.js'
 import { useAuth } from './stores/userStore.js'
+import { useQuota } from './stores/quotaStore.js'
 import {
   createConversation,
   deleteConversation,
@@ -217,12 +229,25 @@ import { fmtClock, fmtRelative, nowClock } from './utils/time.js'
 const {
   isAuthenticated,
   currentUser,
+  authToken,
+  sessionReady,
   logout: authLogout,
   lastAuthIsNew,
   needsNicknamePrompt,
   saveNickname: saveNicknameApi,
   clearNicknamePrompt
 } = useAuth()
+
+// 每日输出 token 额度（前端只展示与锁定；真正拦截在后端）
+const {
+  quota,
+  exceeded: quotaExceeded,
+  resetLabel: quotaResetLabel,
+  loadUsage,
+  refreshIfReset,
+  applyUsage,
+  resetUsage
+} = useQuota()
 
 // 聊天应用状态
 const conversations = ref([])
@@ -263,11 +288,6 @@ function abortStream() {
     streamController.abort()
     streamController = null
   }
-}
-
-function previewOf(text) {
-  const oneLine = (text || '').replace(/\s+/g, ' ').trim()
-  return oneLine.length > 34 ? oneLine.slice(0, 34) + '…' : oneLine
 }
 
 function nowTime() {
@@ -338,7 +358,7 @@ async function loadConversations() {
   if (activeConversationId.value) await loadMessages(activeConversationId.value)
 }
 
-// 登录后一次性拉取模型清单与会话列表（幂等）
+// 登录后一次性拉取模型清单、会话列表与额度快照（幂等）
 let bootstrapping = null
 function bootstrap() {
   if (bootstrapping) return bootstrapping
@@ -346,6 +366,7 @@ function bootstrap() {
     try {
       await loadModels()
       await loadConversations()
+      await loadUsage()
     } catch (error) {
       showToast(error?.message || '加载数据失败')
     } finally {
@@ -359,8 +380,17 @@ async function selectConversation(id) {
   activeConversationId.value = id
   const conversation = conversations.value.find(c => c.id === id)
   if (conversation) {
+    // 已读确认要落到后端（unread 属于后端状态，本地只做乐观展示）；
+    // 仅在此前确实未读时才发请求，避免每次点击都产生一次写入
+    const wasUnread = Boolean(conversation.unread)
     conversation.unread = false
     if (conversation.model) selectedModelId.value = conversation.model
+    if (wasUnread) {
+      updateConversation(id, { unread: false }).catch(error => {
+        conversation.unread = true
+        showToast(error?.message || '标记已读失败')
+      })
+    }
   }
   sidebarOpen.value = false
   try {
@@ -450,15 +480,9 @@ async function sendMessage() {
   // 乐观渲染用户消息
   messages[id].push({ id: uid(), type: 'user', content, timestamp: nowTime() })
 
+  // 标题与预览由后端决定（start/done 事件带回权威值），前端只更新时间戳占位
   const conversation = currentConversation.value
-  if (conversation) {
-    conversation.preview = previewOf(content)
-    conversation.timestamp = '刚刚'
-    // 首次提问时用问题内容自动命名（后端会返回最终标题）
-    if (conversation.title === '新对话') {
-      conversation.title = content.length > 16 ? content.slice(0, 16) + '…' : content
-    }
-  }
+  if (conversation) conversation.timestamp = '刚刚'
 
   inputMessage.value = ''
   isLoading.value = true
@@ -495,6 +519,7 @@ async function sendMessage() {
         if (event.type === 'start') {
           const target = conversations.value.find(c => c.id === id)
           if (target) {
+            // 标题/预览以后端为准
             if (event.title) target.title = event.title
             if (event.preview) target.preview = event.preview
             target.timestamp = '刚刚'
@@ -505,19 +530,39 @@ async function sendMessage() {
 
         if (event.type === 'thinking') {
           message.thinking += event.delta
+          // 流式过程中的实时占位；结束后由 done/error 带回后端测量值覆盖
           message.thinkingSec = Math.max(1, Math.round((Date.now() - thinkStart) / 1000))
           message.phase = 'think'
         } else if (event.type === 'content') {
           message.content += event.delta
           message.phase = 'answer'
-        } else if (event.type === 'done') {
+        } else if (event.type === 'done' || event.type === 'error') {
           message.phase = 'done'
+          // 思考耗时以后端落库值为准，刷新前后保持一致
+          if (typeof event.thinkingSec === 'number') message.thinkingSec = event.thinkingSec
+          // 每轮结束同步最新额度，耗尽即锁定输入框（无需轮询）
+          if (event.usage) applyUsage(event.usage)
+          if (event.type === 'done') {
+            const target = conversations.value.find(c => c.id === id)
+            if (target) {
+              if (event.title) target.title = event.title
+              if (event.preview) target.preview = event.preview
+              target.timestamp = '刚刚'
+            }
+          }
         }
       }
     })
     streamError = result?.error || ''
   } catch (error) {
-    if (error?.name !== 'AbortError') streamError = error?.message || '生成回复失败'
+    if (error?.name !== 'AbortError') {
+      streamError = error?.message || '生成回复失败'
+      // 额度用尽（402）：后端是硬闸门，这里同步状态并锁定输入框
+      if (error?.code === 'quota_exceeded') {
+        applyUsage(error.payload)
+        streamError = error?.message || '今日输出 token 已达上限'
+      }
+    }
   } finally {
     streamController = null
     isLoading.value = false
@@ -534,11 +579,9 @@ async function sendMessage() {
       }
     }
 
+    // 预览以 start/done 事件带回的后端值为准，这里不再本地重算
     const target = conversations.value.find(c => c.id === id)
-    if (target && message?.content) {
-      target.preview = previewOf(message.content)
-      target.timestamp = '刚刚'
-    }
+    if (target && message?.content) target.timestamp = '刚刚'
     if (streamError) showToast(streamError)
   }
 }
@@ -593,10 +636,12 @@ async function saveNickname() {
 
 function handleLogout() {
   abortStream()
-  authLogout()
+  // 会先请求后端撤销该账号的全部令牌，再清空本地状态
+  void authLogout()
   conversations.value = []
   Object.keys(messages).forEach(key => { delete messages[key] })
   activeConversationId.value = ''
+  resetUsage()
   showToast('已退出登录')
 }
 
@@ -630,19 +675,67 @@ function onViewportChange(e) {
   if (e.matches) sidebarOpen.value = false
 }
 
+// 额度跨日自动解锁：额度用尽后每分钟检查一次重置时刻，到了就重新拉取
+let quotaTimer = null
+
 onMounted(() => {
   mql?.addEventListener('change', onViewportChange)
   if (isAuthenticated.value) bootstrap()
+  quotaTimer = setInterval(() => { void refreshIfReset() }, 60 * 1000)
   console.log('NosChat AI 聊天应用已启动', { isAuthenticated: isAuthenticated.value })
 })
 
 onBeforeUnmount(() => {
   mql?.removeEventListener('change', onViewportChange)
+  if (quotaTimer) {
+    clearInterval(quotaTimer)
+    quotaTimer = null
+  }
   abortStream()
 })
 </script>
 
 <style scoped>
+/* 登录态校验占位（存在本地令牌但后端尚未确认时显示） */
+.app-boot {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.boot-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  padding: 2rem 2.5rem;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 1.25rem;
+  backdrop-filter: blur(10px);
+  color: #fff;
+  font-size: 0.9rem;
+}
+
+.boot-card p {
+  margin: 0;
+}
+
+.boot-spinner {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+  animation: boot-spin 0.9s linear infinite;
+}
+
+@keyframes boot-spin {
+  to { transform: rotate(360deg); }
+}
+
 .app-container {
   display: flex;
   flex-direction: column;
@@ -1284,6 +1377,7 @@ onBeforeUnmount(() => {
 
 @media (prefers-reduced-motion: reduce) {
   .logo-icon { animation: none; }
+  .boot-spinner { animation: none; }
   .menu-bars,
   .menu-bars::before,
   .menu-bars::after { transition: none; }

@@ -14,11 +14,15 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import __version__
+from .cache import cache_delete
 from .config import get_settings
 from .database import SessionLocal, dispose_db, init_db
 from .llm import close_clients
 from .model_registry import registry
-from .routers import auth, catalog, chat
+from .redis_client import close_redis, init_redis, redis_state
+from .routers import auth, catalog, chat, usage
+from .routers.catalog import CACHE_KEY as CATALOG_CACHE_KEY
+from .usage import QuotaExceeded
 
 settings = get_settings()
 
@@ -65,6 +69,9 @@ async def _wait_for_database() -> None:
 async def lifespan(app: FastAPI):
     _ensure_loop_compatible()
     registry.load()
+    await init_redis()
+    # 模型清单缓存与注册表必须一致：启动时清一次，避免沿用旧镜像/旧配置的缓存
+    await cache_delete(CATALOG_CACHE_KEY)
     await _wait_for_database()
     await init_db()
 
@@ -72,17 +79,21 @@ async def lifespan(app: FastAPI):
         logger.warning("JWT_SECRET 仍为默认值，请在生产环境中替换为随机长字符串")
     if not settings.smtp_enabled and not settings.auth_dev_echo_code:
         logger.warning("未配置 SMTP 且未开启 AUTH_DEV_ECHO_CODE，注册/登录将无法发送验证码")
+    if not settings.redis_enabled:
+        logger.warning("未配置 REDIS_URL：缓存与限流将以进程内降级模式运行")
 
     logger.info(
-        "NosChat API 已启动：port=%s models=%d cors=%s",
+        "NosChat API 已启动：port=%s models=%d cors=%s daily_token_limit=%d",
         settings.port,
         len(registry.models),
         settings.cors_origin_list,
+        settings.daily_output_token_limit,
     )
     try:
         yield
     finally:
         await close_clients()
+        await close_redis()
         await dispose_db()
         logger.info("NosChat API 已关闭")
 
@@ -109,9 +120,20 @@ async def _database_error_handler(request: Request, exc: SQLAlchemyError) -> JSO
     return JSONResponse(status_code=503, content={"detail": "数据库暂时不可用，请稍后重试"})
 
 
+@app.exception_handler(QuotaExceeded)
+async def _quota_error_handler(request: Request, exc: QuotaExceeded) -> JSONResponse:
+    """额度用尽：402（与限流的 429 区分），前端据此锁定输入框。
+
+    这是后端的硬闸门——前端是否锁定、是否被绕过都不影响该判定。
+    """
+    logger.info("输出 token 额度已用尽：user=%s used=%s/%s", request.url.path, exc.used, exc.limit)
+    return JSONResponse(status_code=402, content=exc.payload())
+
+
 app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(catalog.router, prefix=settings.api_prefix)
 app.include_router(chat.router, prefix=settings.api_prefix)
+app.include_router(usage.router, prefix=settings.api_prefix)
 
 
 @app.get("/health", tags=["system"], summary="健康检查")
@@ -120,4 +142,5 @@ async def health() -> dict:
         "status": "ok",
         "version": __version__,
         "models": len(registry.models),
+        "redis": await redis_state(),
     }

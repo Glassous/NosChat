@@ -60,8 +60,10 @@ export async function streamChat({ conversationId, model, content, signal, onEve
 
   if (!response.ok) {
     let detail = ''
+    let payload = null
     try {
       const data = await response.json()
+      payload = data && typeof data === 'object' ? data : null
       detail = typeof data?.detail === 'string' ? data.detail : ''
     } catch {
       detail = ''
@@ -70,7 +72,12 @@ export async function streamChat({ conversationId, model, content, signal, onEve
       clearAuthStorage()
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT))
     }
-    throw new ApiError(detail || `对话请求失败（${response.status}）`, response.status)
+    // code 用于区分「额度用尽（402）」与「限流（429）」：前者锁定输入框，后者只提示
+    throw new ApiError(detail || `对话请求失败（${response.status}）`, response.status, {
+      code: typeof payload?.code === 'string' ? payload.code : '',
+      payload,
+      retryAfter: Number(response.headers.get('Retry-After')) || 0
+    })
   }
 
   if (!response.body) {

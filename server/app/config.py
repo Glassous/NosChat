@@ -85,8 +85,48 @@ class Settings(BaseSettings):
     code_resend_interval_seconds: int = 60
     code_max_attempts: int = 5
 
+    # ---- Redis（缓存 + 限流）----
+    # 留空即整体禁用 Redis：缓存未命中直接回源数据库，限流走进程内兜底
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_key_prefix: str = "noschat"
+    # 单次 Redis 操作的超时（秒）：取小值，避免 Redis 挂起拖慢请求
+    redis_socket_timeout: float = 0.5
+    # 熔断时长（秒）：Redis 出错后在该窗口内直接跳过 Redis，走降级路径
+    redis_retry_seconds: float = 30.0
+    # 模型清单缓存 TTL（秒）
+    catalog_cache_seconds: int = 300
+    # 额度快照缓存 TTL（秒）
+    quota_cache_seconds: int = 10
+
+    # ---- 每用户每日输出 token 额度 ----
+    # 只统计模型输出（thinking + content），输入 token 不计
+    daily_output_token_limit: int = 100000
+    # 额度重置时区（按该时区的自然日切分）
+    quota_timezone: str = "Asia/Shanghai"
+
+    # ---- 限流 ----
+    rate_limit_enabled: bool = True
+    login_rate_limit_per_email: int = 5
+    login_rate_limit_per_ip: int = 20
+    login_rate_limit_window_seconds: int = 300
+    send_code_rate_limit_per_ip: int = 20
+    send_code_rate_limit_window_seconds: int = 3600
+    register_rate_limit_per_ip: int = 10
+    register_rate_limit_window_seconds: int = 3600
+    chat_rate_limit_per_user: int = 20
+    chat_rate_limit_window_seconds: int = 60
+
+    # ---- 反向代理 ----
+    # 容器部署经 docker-proxy 转发后对端是网桥网关 IP，需设为 "*" 才能正确解析
+    # X-Forwarded-For（compose 只把端口绑在 127.0.0.1，外部无法直达容器）
+    forwarded_allow_ips: str = "127.0.0.1"
+
     # ---- 模型清单 ----
     models_config_path: str = str(BASE_DIR / "config" / "models.json")
+
+    # ---- 上游流式用量上报 ----
+    # 部分第三方网关不认 stream_options.include_usage，默认不发送，仅机会式读取
+    openai_stream_usage: bool = False
 
     # ---- CORS ----
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
@@ -118,6 +158,26 @@ class Settings(BaseSettings):
     def smtp_enabled(self) -> bool:
         """是否具备真实发信能力。"""
         return bool(self.smtp_host)
+
+    @property
+    def redis_enabled(self) -> bool:
+        """是否配置了 Redis（留空即禁用，缓存与限流都走降级路径）。"""
+        return bool(self.redis_url.strip())
+
+    @property
+    def quota_tzinfo(self):
+        """额度重置时区；时区数据缺失时回退 UTC 并告警。"""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            return ZoneInfo(self.quota_timezone)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):  # pragma: no cover
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "无法加载时区「%s」（缺少 tzdata？），额度重置回退为 UTC", self.quota_timezone
+            )
+            return ZoneInfo("UTC")
 
     @property
     def models_config_file(self) -> Path:

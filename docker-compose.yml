@@ -1,9 +1,10 @@
-# NosChat 容器化部署：仅包含后端 API 与 PostgreSQL，不包含前端。
+# NosChat 容器化部署：后端 API + PostgreSQL + Redis，不包含前端。
 # 前端可继续以 `cd web ; npm run dev`（开发）或独立部署静态产物（生产）。
 #
-# 环境变量统一放在 server/.env（后端唯一配置文件），两个服务都直接读取它：
-#   - db  需要 POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB（Postgres 官方镜像的变量名）
-#   - api 需要 OPENAI_* / JWT_* / SMTP_* / MODEL_* 等
+# 环境变量统一放在 server/.env（后端唯一配置文件），各服务都直接读取它：
+#   - db    需要 POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB（Postgres 官方镜像的变量名）
+#   - api   需要 OPENAI_* / JWT_* / SMTP_* / MODEL_* 等
+#   - redis 只做缓存与限流，无需额外配置（REDIS_URL 由 compose 注入为服务名）
 # 使用：
 #   1) 复制 server/.env.example 为 server/.env 并填写配置
 #   2) docker compose up -d --build
@@ -32,6 +33,30 @@ services:
     networks:
       - noschat
 
+  redis:
+    image: redis:7-alpine
+    container_name: noschat-redis
+    restart: unless-stopped
+    # 只做缓存与限流：关闭持久化（额度以 PostgreSQL 为准，限流窗口会自然重建），
+    # 内存打满时按 LRU 淘汰
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - noschat
+
   api:
     build:
       context: ./server
@@ -42,6 +67,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - path: ./server/.env
         required: true
@@ -50,6 +77,11 @@ services:
       PORT: 9135
       # 容器网络内通过服务名 db 访问数据库（覆盖 server/.env 里的 POSTGRES_HOST）
       POSTGRES_HOST: db
+      # 容器网络内通过服务名 redis 访问缓存（覆盖 server/.env 里的 REDIS_URL）
+      REDIS_URL: redis://redis:6379/0
+      # 经 docker-proxy 转发时对端是网桥网关 IP，必须信任代理才能拿到真实客户端 IP；
+      # 端口只绑在 127.0.0.1，外部无法直达容器，因此设为 "*" 是安全的
+      FORWARDED_ALLOW_IPS: "*"
       MODELS_CONFIG_PATH: config/models.json
     ports:
       # 仅监听本机，由反向代理（Nginx / 1Panel OpenResty）对外提供访问

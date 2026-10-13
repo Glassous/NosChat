@@ -15,10 +15,16 @@ export const USER_KEY = 'noschat.user'
 export const UNAUTHORIZED_EVENT = 'noschat:unauthorized'
 
 export class ApiError extends Error {
-  constructor(message, status = 0) {
+  constructor(message, status = 0, { code = '', payload = null, retryAfter = 0 } = {}) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    /** 后端错误码，例如 quota_exceeded / rate_limited（前端据此决定是否锁定输入框） */
+    this.code = code
+    /** 后端返回的完整错误体（额度类错误会带 limit / used / resetAt 等字段） */
+    this.payload = payload
+    /** 限流时的建议等待秒数（来自 Retry-After 响应头） */
+    this.retryAfter = retryAfter
   }
 }
 
@@ -112,7 +118,13 @@ export async function request(path, options = {}) {
       clearAuthStorage()
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT))
     }
-    throw new ApiError(extractMessage(data, response.status), response.status)
+    const code = data && typeof data === 'object' && typeof data.code === 'string' ? data.code : ''
+    const retryAfter = Number(response.headers.get('Retry-After')) || 0
+    throw new ApiError(extractMessage(data, response.status), response.status, {
+      code,
+      payload: data && typeof data === 'object' ? data : null,
+      retryAfter
+    })
   }
 
   return data

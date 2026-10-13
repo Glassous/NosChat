@@ -57,6 +57,14 @@ export function fetchMe() {
   return request('/api/auth/me')
 }
 
+/**
+ * 退出登录：后端会把令牌版本 +1，使该账号此前签发的所有令牌立即失效。
+ * 前端必须在清空本地令牌之前发起该请求（请求头读取 localStorage 中的令牌）。
+ */
+export function logout() {
+  return request('/api/auth/logout', { method: 'POST' })
+}
+
 /** 更新昵称（昵称留空时后端会回退为邮箱） */
 export function updateProfile({ nickname }) {
   return request('/api/auth/me', {

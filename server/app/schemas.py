@@ -161,6 +161,21 @@ class ChatStreamRequest(CamelModel):
     content: str = Field(min_length=1, max_length=4000)
 
 
+# ---------------------------------------------------------------- 用量与额度
+
+
+class UsageOut(CamelModel):
+    """当日输出 token 额度快照（限额、已用、剩余与重置时刻）。"""
+
+    limit: int
+    used: int
+    remaining: int
+    exceeded: bool
+    reset_at: str
+    day: str
+    timezone: str
+
+
 # ---------------------------------------------------------------- 序列化辅助
 
 

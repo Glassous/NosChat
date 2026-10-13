@@ -37,6 +37,10 @@ def main() -> None:
         log_level="debug" if settings.debug else "info",
         loop="none",  # 事件循环由本脚本创建
         access_log=True,
+        # 容器经 docker-proxy 转发时对端是网桥网关 IP，默认信任列表不匹配会导致
+        # X-Forwarded-For 被忽略（所有客户端看起来是同一个 IP）。容器部署请设
+        # FORWARDED_ALLOW_IPS=*（端口只绑在 127.0.0.1，外部无法直达）。
+        forwarded_allow_ips=settings.forwarded_allow_ips,
     )
     server = uvicorn.Server(config)
 

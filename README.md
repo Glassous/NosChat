@@ -18,37 +18,46 @@ Vue 3 前端 + FastAPI 后端 + PostgreSQL 的 AI 聊天应用：真实的 OpenA
 - 📱 **响应式设计**：桌面端内联侧栏、窄屏抽屉（原样保留）
 
 ### 后端
-- 🚀 **FastAPI**（默认 `9135` 端口）+ PostgreSQL（SQLAlchemy 2.x 异步 + psycopg3）
+- 🚀 **FastAPI**（默认 `9135` 端口）+ PostgreSQL（SQLAlchemy 2.x 异步 + psycopg3）+ Redis
 - 🤖 **真实模型调用**：一个 `OPENAI_BASE_URL` + 一个 `OPENAI_API_KEY` + 多个 model（OpenAI 标准接口）
 - 🌊 **SSE 流式转发**：思考内容与正式回答分别流式下发，前端逐字渲染
 - ✉️ **SMTP 邮件验证码**：按用途（注册 / 登录 / 重置）分别校验与限流（哈希存储、有效期、重发间隔、错误次数限制）
-- 🔑 **密码与令牌**：bcrypt 密码哈希 + JWT 访问令牌，重置密码后旧令牌立即失效
+- 🔑 **密码与令牌**：bcrypt 密码哈希 + JWT 访问令牌，重置密码或登出后旧令牌立即失效
 - 🗂️ **会话与消息持久化**：按用户隔离，自动生成标题与预览
-- ⚙️ **环境变量驱动**：数据库、密钥、邮件、模型、CORS 等全部可配置
-- 🐳 **容器化部署**：`docker compose` 一键起后端 + PostgreSQL（不含前端）
+- 🧮 **每日输出 token 额度**：按用户、按自然日（`QUOTA_TIMEZONE`）统计模型输出（thinking + content），
+  用尽后由后端返回 `402` 拒绝——绕过前端输入框也无效
+- 🚦 **限流**：登录/发码/注册按账号与 IP 双维度限流，对话按用户限流，超限返回 `429` + `Retry-After`
+- ⚡ **Redis 缓存与降级**：模型清单与额度快照走 Redis；Redis 不可用时缓存自动回源、限流降级为进程内兜底，服务不中断
+- ⚙️ **环境变量驱动**：数据库、密钥、邮件、模型、额度、限流、CORS 等全部可配置
+- 🐳 **容器化部署**：`docker compose` 一键起后端 + PostgreSQL + Redis（不含前端）
 
 ## 架构
 
 ```
 ┌────────────────────┐   /api/models        ┌──────────────────────────┐
 │  Vue 3 前端 (web/) │   /api/auth/*        │  FastAPI 后端 (server/)  │
-│  仅数据/API 层改造 │ ───────────────────► │  9135                    │
+│  仅展示与输入      │ ───────────────────► │  9135                    │
 │  Vite dev: 3000    │   /api/conversations │                          │
 │                    │ ◄══ SSE 流式 ◄══════ │  ┌────────────────────┐  │
 └────────────────────┘   /api/chat/stream   │  │ OpenAI 兼容接口    │  │
-                                            │  │ base_url + key     │  │
+                         /api/usage/today   │  │ base_url + key     │  │
                                             │  └────────────────────┘  │
                                             │  ┌────────────────────┐  │
                                             │  │ SMTP 邮件服务      │  │
                                             │  └────────────────────┘  │
-                                            └───────────┬──────────────┘
-                                                        │
-                                              ┌─────────▼─────────┐
-                                              │   PostgreSQL 16   │
-                                              │  用户/验证码/会话 │
-                                              │  /消息            │
-                                              └───────────────────┘
+                                            └────┬──────────────┬──────┘
+                                                 │              │
+                                   ┌─────────────▼───┐   ┌──────▼──────────┐
+                                   │  PostgreSQL 16  │   │   Redis 7       │
+                                   │  用户/验证码    │   │   缓存 + 限流   │
+                                   │  会话/消息      │   │  （额度以 PG    │
+                                   │  每日输出用量   │   │    为准）       │
+                                   └─────────────────┘   └─────────────────┘
 ```
+
+> **权威边界**：邮箱登录、聊天调用、会话/消息存储、每日额度判定、限流**全部在后端**。
+> 前端只负责展示与输入；`localStorage` 里只有令牌、昵称缓存与界面偏好（模型、思考开关），
+> 不含任何会话或消息。锁定输入框只是体验优化，绕过它也无法超额度。
 
 ## 项目结构
 
@@ -59,35 +68,41 @@ NosChat/
 │   │   ├── main.py                           # 应用入口：CORS、路由挂载、启动建表、/health
 │   │   ├── config.py                         # 环境变量（pydantic-settings）
 │   │   ├── database.py                       # 异步 engine / session / 建表
-│   │   ├── models.py                         # ORM：User / EmailVerification / Conversation / Message
+│   │   ├── models.py                         # ORM：User / EmailVerification / Conversation / Message / DailyUsage
 │   │   ├── schemas.py                        # 请求响应模型（对外 camelCase）
 │   │   ├── security.py                       # bcrypt 密码哈希、JWT、验证码哈希
 │   │   ├── deps.py                           # get_db / get_current_user
 │   │   ├── mailer.py                         # aiosmtplib 发送验证码邮件
-│   │   ├── llm.py                            # AsyncOpenAI 流式调用（含友好错误映射）
+│   │   ├── llm.py                            # AsyncOpenAI 流式调用（含友好错误映射与用量上报）
+│   │   ├── redis_client.py                   # Redis 连接池 / 超时熔断 / 健康态
+│   │   ├── cache.py                          # Redis 缓存封装（fail-open）
+│   │   ├── ratelimit.py                      # 限流（Redis 固定窗口 + 进程内兜底）
+│   │   ├── usage.py                          # 每日输出 token 额度：判定 / 记账 / 估算
 │   │   ├── model_registry.py                 # 模型清单加载与兜底
-│   │   └── routers/{auth,catalog,chat}.py    # 认证 / 模型清单 / 会话与流式对话
+│   │   └── routers/{auth,catalog,chat,usage}.py  # 认证 / 模型清单 / 会话与流式对话 / 额度
 │   ├── config/models.json                    # 模型清单备用来源（介绍、发布日期、标签等）
 │   ├── scripts/export_models_env.py          # 把 models.json 导出为 .env 的 MODEL_* 写法
-│   ├── tests/{smoke_api.py,mock_llm.py}      # 接口冒烟测试、本地 Mock 模型服务
+│   ├── tests/{smoke_api.py,quota_smoke.py,mock_llm.py}  # 接口冒烟、额度端到端、本地 Mock 模型服务
 │   ├── requirements.txt
 │   ├── Dockerfile
 │   ├── .env.example
-│   └── run.py                                # 启动入口（Windows 事件循环兼容）
+│   └── run.py                                # 启动入口（Windows 事件循环兼容 + 代理信任配置）
 ├── web/                                      # 前端（不进入容器）
 │   └── src/
-│       ├── api/{client,auth,chat}.js         # 新增：接口客户端、认证、模型/会话/SSE
-│       ├── utils/time.js                     # 新增：时间展示格式化
-│       ├── stores/userStore.js               # 改造：对接后端鉴权（保留原暴露字段）
-│       ├── data/models.js                    # 改造：模型清单运行时注册表
-│       ├── components/AuthPage.vue           # 增补：密码/验证码登录、注册、找回密码
-│       ├── components/ModelSelector.vue      # 微调：清单为空时的兜底，避免渲染报错
-│       ├── App.vue                           # 改造：真实模型清单 / SSE / 会话持久化（模板不变）
-│       └── ...                               # 其余组件未改动
+│       ├── api/{client,auth,chat,usage}.js   # 接口客户端、认证、模型/会话/SSE、额度
+│       ├── utils/time.js                     # 时间展示格式化
+│       ├── stores/userStore.js               # 用户状态（后端鉴权 + 登录态校验 + 后端登出）
+│       ├── stores/quotaStore.js              # 每日额度状态（展示与输入框锁定）
+│       ├── data/models.js                    # 模型清单运行时注册表
+│       ├── components/AuthPage.vue           # 密码/验证码登录、注册、找回密码
+│       ├── components/ModelSelector.vue      # 模型选择
+│       ├── components/ChatInput.vue          # 输入框（额度用尽时显示上限并锁定）
+│       ├── App.vue                           # 真实模型清单 / SSE / 会话持久化 / 额度与登出
+│       └── ...                               # 其余组件
 ├── .github/workflows/                        # GitHub Actions（云端构建 + 传输部署）
 │   ├── deploy-web.yml                        #   前端 → 1Panel 站点 index/dist
-│   └── deploy-api.yml                        #   后端 → /opt/noschat（镜像 + compose）
-├── docker-compose.yml                        # 后端 + PostgreSQL（不含前端）
+│   └── deploy-api.yml                        #   后端 → /opt/noschat（镜像 + compose + redis 服务）
+├── docker-compose.yml                        # 后端 + PostgreSQL + Redis（不含前端）
 └── check-project-structure.js                # 项目结构自检
 ```
 
@@ -95,19 +110,19 @@ NosChat/
 
 ## 快速开始
 
-### 方式一：容器化（后端 + PostgreSQL）
+### 方式一：容器化（后端 + PostgreSQL + Redis）
 
 ```bash
 # 1) 准备环境变量（Windows PowerShell：Copy-Item server\.env.example server\.env）
 cp server/.env.example server/.env
 # 必填：JWT_SECRET、OPENAI_*、SMTP_*、MODEL_*（模型清单与介绍也在这里维护）
 
-# 2) 构建并启动
+# 2) 构建并启动（db + redis + api）
 docker compose up -d --build
 
 # 3) 健康检查（容器只监听本机 127.0.0.1:9135，由反向代理对外提供服务）
 curl http://localhost:9135/health
-# {"status":"ok","version":"1.0.0","models":9}
+# {"status":"ok","version":"1.0.0","models":9,"redis":"ok"}
 
 # 4) 前端仍单独运行（容器不含前端）
 cd web && npm install && npm run dev     # http://localhost:3000
@@ -129,13 +144,25 @@ npm install
 npm run dev                                       # http://localhost:3000
 ```
 
+> 本地开发若没有 Redis，可以不启动它：把 `REDIS_URL` 留空即可，缓存会直接回源数据库、
+> 限流自动降级为进程内兜底（`/health` 会显示 `"redis":"disabled"`）。
+
 > **Windows 提示**：请使用 `python run.py` 启动后端。psycopg 的异步模式不支持 Windows 默认的 `ProactorEventLoop`，`run.py` 会自动切换到 `SelectorEventLoop`；直接执行 `python -m uvicorn app.main:app` 会报 `Psycopg cannot use the 'ProactorEventLoop'`。
 
 ### 接口冒烟测试
 
 ```bash
 cd server
-python tests/smoke_api.py            # 覆盖注册/登录/模型/会话/SSE/错误路径
+python tests/smoke_api.py            # 覆盖注册/登录/登出/模型/会话/SSE/额度/限流/错误路径
+```
+
+额度闸门（含"绕过前端直接打接口"）的端到端用例需要后端以低额度启动：
+
+```bash
+# 终端 1（Windows PowerShell：$env:DAILY_OUTPUT_TOKEN_LIMIT=30）
+cd server && DAILY_OUTPUT_TOKEN_LIMIT=30 python run.py
+# 终端 2
+cd server && python tests/quota_smoke.py
 ```
 
 本地没有真实模型服务时，可用自带 Mock：
@@ -154,6 +181,9 @@ python tests/mock_llm.py             # 127.0.0.1:9901
 | --- | --- | --- | --- |
 | `deploy-web.yml` | `web/**` 变更推送 main | `npm ci && npm run build` 后打包 | 解压到 `/opt/1panel/www/sites/noschat.vodyanitsa.top/index/dist` |
 | `deploy-api.yml` | `server/**`、`docker-compose.yml` 变更推送 main | `docker build` 后端镜像并 `docker save \| gzip` | `docker load` → `docker compose up -d`（同时同步 compose 与 `server/` 源码） |
+
+> `docker-compose.yml` 已包含 `redis` 服务，CI 会同步该文件并执行 `docker compose up -d`，
+> 因此 **新增 Redis 不需要改任何工作流**：部署时会自动从 Docker Hub 拉取镜像并启动。
 
 两者都支持在 Actions 页面手动触发（`workflow_dispatch`）。
 
@@ -269,8 +299,30 @@ location /api/ {
 | `CODE_TTL_SECONDS` | `300` | 验证码有效期 |
 | `CODE_RESEND_INTERVAL_SECONDS` | `60` | 同邮箱重发间隔（限流） |
 | `CODE_MAX_ATTEMPTS` | `5` | 单个验证码最大校验次数 |
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis 地址；**留空即禁用**（缓存回源、限流走进程内兜底） |
+| `REDIS_KEY_PREFIX` | `noschat` | Redis 键前缀 |
+| `REDIS_SOCKET_TIMEOUT` | `0.5` | 单次 Redis 操作超时（秒） |
+| `REDIS_RETRY_SECONDS` | `30` | Redis 出错后的熔断时长（该窗口内不再尝试连接） |
+| `CATALOG_CACHE_SECONDS` | `300` | `/api/models` 缓存 TTL |
+| `QUOTA_CACHE_SECONDS` | `10` | 额度快照缓存 TTL |
+| `DAILY_OUTPUT_TOKEN_LIMIT` | `100000` | 每用户每日输出 token 上限（只算 thinking + content，输入不计） |
+| `QUOTA_TIMEZONE` | `Asia/Shanghai` | 额度按该时区的自然日重置 |
+| `RATE_LIMIT_ENABLED` | `true` | 限流总开关 |
+| `LOGIN_RATE_LIMIT_PER_EMAIL` | `5` | 登录/验证码登录/重置密码的账号维度阈值 |
+| `LOGIN_RATE_LIMIT_PER_IP` | `20` | 登录的 IP 维度阈值 |
+| `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `300` | 登录限流窗口 |
+| `SEND_CODE_RATE_LIMIT_PER_IP` | `20` | 发送验证码的 IP 阈值（窗口 3600s） |
+| `REGISTER_RATE_LIMIT_PER_IP` | `10` | 注册的 IP 阈值（窗口 3600s） |
+| `CHAT_RATE_LIMIT_PER_USER` | `20` | 对话每分钟请求数（窗口 60s） |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | 可信反向代理；**容器部署必须为 `*`**（见下文说明） |
+| `OPENAI_STREAM_USAGE` | `false` | 是否向上游请求 `stream_options.include_usage` |
 | `MODEL_1`、`MODEL_2`… | 空 | 在 `.env` 里声明模型清单（`id=xx;name=yy;desc=zz…`），定义了即优先生效 |
 | `MODELS_CONFIG_PATH` | `config/models.json` | 未定义任何 `MODEL_*` 时使用的模型清单文件路径 |
+
+> **`FORWARDED_ALLOW_IPS` 为什么必须是 `*`**：容器部署时端口经 docker-proxy 转发，
+> 后端看到的对端是网桥网关 IP 而不是 `127.0.0.1`，uvicorn 默认的信任列表匹配不上，
+> `X-Forwarded-For` 会被忽略——结果是**所有客户端看起来都是同一个 IP**，IP 限流会误伤全网。
+> 由于 compose 只把 9135 绑在 `127.0.0.1`、外部无法直达容器，信任所有代理是安全的。
 
 ### 前端（`web/.env`）
 
@@ -335,21 +387,23 @@ python scripts/export_models_env.py -o models.env  # 写入文件
 
 | 方法 | 路径 | 说明 | 鉴权 |
 | --- | --- | --- | --- |
-| GET | `/health` | 健康检查（含已加载模型数） | 否 |
-| POST | `/api/auth/send-code` | 发送验证码，`purpose` 取 `register`/`login`/`reset`（同邮箱同用途 60s 限流） | 否 |
+| GET | `/health` | 健康检查（含已加载模型数与 Redis 状态） | 否 |
+| POST | `/api/auth/send-code` | 发送验证码，`purpose` 取 `register`/`login`/`reset`（同邮箱同用途 60s 限流 + IP 限流） | 否 |
 | POST | `/api/auth/register` | 邮箱验证码注册（成功即返回令牌；昵称留空则用邮箱） | 否 |
-| POST | `/api/auth/login` | 邮箱 + 密码登录 | 否 |
+| POST | `/api/auth/login` | 邮箱 + 密码登录（账号维度限流先于密码校验） | 否 |
 | POST | `/api/auth/login-code` | 邮箱验证码登录，**未注册的邮箱自动注册**（`isNewUser` 标识） | 否 |
 | POST | `/api/auth/reset-password` | 找回密码：验证码校验后重置密码，旧令牌全部失效 | 否 |
+| POST | `/api/auth/logout` | 退出登录：令牌版本 +1，该账号此前签发的**所有**令牌立即失效 | 是 |
 | GET | `/api/auth/me` | 当前登录用户 | 是 |
 | PATCH | `/api/auth/me` | 更新昵称（留空则回退为邮箱） | 是 |
-| GET | `/api/models` | 模型清单（含介绍 / 发布日期等） | 否 |
+| GET | `/api/models` | 模型清单（含介绍 / 发布日期等，结果缓存在 Redis） | 否 |
+| GET | `/api/usage/today` | 当日输出 token 额度快照（限额 / 已用 / 剩余 / 重置时刻） | 是 |
 | GET | `/api/conversations` | 会话列表（置顶优先、按更新时间倒序） | 是 |
 | POST | `/api/conversations` | 新建会话（附带欢迎消息） | 是 |
 | GET | `/api/conversations/{id}/messages` | 会话消息列表 | 是 |
-| PATCH | `/api/conversations/{id}` | 更新标题 / 模型 / 置顶 / 未读 | 是 |
+| PATCH | `/api/conversations/{id}` | 更新标题 / 模型 / 置顶 / 未读（标记已读不会改变 `updatedAt`） | 是 |
 | DELETE | `/api/conversations/{id}` | 删除会话（级联删除消息） | 是 |
-| POST | `/api/chat/stream` | 流式对话（`text/event-stream`） | 是 |
+| POST | `/api/chat/stream` | 流式对话（`text/event-stream`）；额度用尽返回 `402`，限流返回 `429` | 是 |
 
 ### 认证流程
 
@@ -368,28 +422,80 @@ python scripts/export_models_env.py -o models.env  # 写入文件
 data: {"type":"start","conversationId":"...","userMessageId":"...","title":"...","preview":"..."}
 data: {"type":"thinking","delta":"..."}    # 推理模型的思考增量（可能没有）
 data: {"type":"content","delta":"..."}     # 回答增量
-data: {"type":"done","conversationId":"...","messageId":"...","title":"...","preview":"..."}
-data: {"type":"error","message":"..."}     # 上游失败等错误（不会写入空消息）
+data: {"type":"done","conversationId":"...","messageId":"...","title":"...","preview":"...",
+       "thinkingSec":12,"usage":{"limit":100000,"used":3210,"remaining":96790,"exceeded":false,
+                                 "resetAt":"2026-10-14 00:00","day":"2026-10-13",
+                                 "timezone":"Asia/Shanghai","estimated":true}}
+data: {"type":"error","message":"...","thinkingSec":0,"usage":{...}}   # 上游失败等（不会写入空消息）
 ```
+
+- `title` / `preview` / `thinkingSec` **均为后端权威值**：前端不再自行截断标题、也不再用本地计时器算思考耗时。
+- `usage` 是每轮结束后的额度快照，前端据此即时锁定/解锁输入框，无需轮询。
+- `usage.estimated` 为 `true` 表示上游未上报用量，该值由字符估算得出。
+
+### 额度用尽（402）
+
+额度判定在**请求开始**执行，且只认 JWT 里的用户身份：
+
+```json
+HTTP/1.1 402 Payment Required
+{"detail":"今日输出 token 已达上限（100000），将于 2026-10-14 00:00 重置",
+ "code":"quota_exceeded","limit":100000,"used":100240,
+ "resetAt":"2026-10-14 00:00","day":"2026-10-13","timezone":"Asia/Shanghai"}
+```
+
+- 判定通过的那一轮会**完整跑完**（允许把用量推过上限），以保证最后一条回复不被截断；
+  之后直到当日重置前一律返回 `402`。
+- 前端额度用尽时会显示"已达上限 + 重置时间"并锁定输入框，但那只是体验优化：
+  **直接调用接口同样会被后端拦下**。
+
+### 限流（429）
+
+超限返回 `429` + `Retry-After`（秒），并按账号维度与 IP 维度分别计数
+（账号维度是暴力破解的主防线；IP 维度依赖 `FORWARDED_ALLOW_IPS` 正确配置）。
+默认阈值见下文环境变量表。
+
+### 登出语义
+
+`POST /api/auth/logout` 会把该用户的令牌版本 `+1`，使**此前签发的所有访问令牌立即失效**（含其它设备）。
+这是无状态 JWT 下不引入黑名单即可做到服务端撤销的最简方式，代价是多设备需各自重新登录。
 
 ## 数据模型
 
 | 表 | 关键字段 | 说明 |
 | --- | --- | --- |
-| `users` | `email`(唯一)、`nickname`、`hashed_password`、`is_active` | 以邮箱为登录账号，密码 bcrypt 存储 |
+| `users` | `email`(唯一)、`nickname`、`hashed_password`、`is_active`、`token_version` | 以邮箱为登录账号，密码 bcrypt 存储；登出/重置密码时 `token_version` +1 |
 | `email_verifications` | `email`、`purpose`、`code_hash`、`expires_at`、`consumed_at`、`attempts` | 验证码只存哈希，含过期与次数限制 |
-| `conversations` | `id`、`user_id`、`title`、`model_id`、`preview`、`pinned`、`unread` | 按 `user_id` + `pinned` + `updated_at` 建索引 |
+| `conversations` | `id`、`user_id`、`title`、`model_id`、`preview`、`pinned`、`unread` | 按 `user_id` + `pinned` + `updated_at` 建索引；`updated_at` 由业务代码显式维护 |
 | `messages` | `id`、`conversation_id`、`role`、`model_id`、`content`、`thinking`、`thinking_sec` | 按 `conversation_id` + `created_at` 建索引 |
+| `daily_usage` | `user_id`、`day`、`output_tokens`、`requests` | 每用户每日输出 token 累计，`(user_id, day)` 唯一，是额度判定的唯一权威来源 |
 
-表结构在服务启动时自动创建（幂等）。
+表结构在服务启动时自动创建（幂等）。Redis 中不存任何业务数据：只缓存模型清单与额度快照，
+以及限流计数器（带 TTL，可随时丢弃重建）。
 
 ## 安全说明
 
 - 密码使用 bcrypt 哈希，验证码以 HMAC-SHA256 哈希入库，二者都不落明文。
 - 访问令牌为 JWT（默认 14 天），所有会话/消息接口都校验令牌并校验资源归属。
+- **登出与重置密码都会把令牌版本 +1**，此前签发的所有令牌立即失效；不再有"点了退出但令牌还能用 14 天"的情况。
+- **暴力破解防护**：登录限流先于密码校验执行，按账号（邮箱哈希，不额外落明文）与 IP 双维度计数，超限返回 `429` + `Retry-After`。
+- **额度是后端硬闸门**：`/api/chat/stream` 每轮独立判定并按 `user_id` 记账，前端输入框锁定只是体验优化。
 - `JWT_SECRET` 必须替换为随机长字符串：`python -c "import secrets;print(secrets.token_urlsafe(48))"`。
 - 生产环境请关闭 `AUTH_DEV_ECHO_CODE`，并只把数据库端口暴露在内网（compose 默认不映射 `db` 端口）。
+- `redis` 服务不发布端口，仅容器网络内可达，因此未设密码（如需外部访问请自行补 `requirepass`）。
 - 后端镜像以非 root 用户运行，`.env` 已通过 `.dockerignore` 排除，不会打进镜像。
+
+## 额度与限流运维要点
+
+| 主题 | 说明 |
+| --- | --- |
+| 计数口径 | 只统计模型**输出**（thinking + content）。优先采用上游上报的 `completion_tokens`，网关不上报时按字符估算（CJK ≈ 1 token/字，其余 ≈ 4 字符/token），并在 `usage.estimated=true` 中标注 |
+| 超标行为 | 额度未满时放行的请求会完整跑完，允许把当日用量略微推过上限（最坏超出量 = 单轮最大输出），之后直到重置前返回 `402` |
+| 重置边界 | 按 `QUOTA_TIMEZONE` 的自然日（默认北京时间 0 点），北京时间由 `tzdata` 提供，缺失时回退 UTC 并打 warning |
+| Redis 故障 | 缓存直接回源 PostgreSQL；限流降级为**进程内固定窗口**（仍然生效，不会变成完全放行）；`/health` 的 `redis` 字段变为 `down`；30 秒后自动重试 |
+| Redis 重启 | 限流计数清零（窗口自然重建），**额度不受影响**（存在 PostgreSQL） |
+| 多 worker | 当前为单进程（`python run.py`）。若将来启用多 worker，Redis 路径精确，降级路径每 worker 各算一份，多进程部署请确保 Redis 可用 |
+| 固定窗口取舍 | 限流用固定窗口，窗口边界存在双倍放行的可能；对暴力破解防护足够 |
 
 ## 常见问题
 
@@ -399,6 +505,10 @@ data: {"type":"error","message":"..."}     # 上游失败等错误（不会写�
 4. **模型调用报 502 / Connection error**：多为本机代理软件拦截，确认 `OPENAI_TRUST_ENV=false`，或把 `OPENAI_BASE_URL` 指向可达地址。
 5. **切换模型后提示保存失败**：模型 id 必须在模型清单中（`.env` 的 `MODEL_*` 或 `server/config/models.json`）。
 6. **模型清单没生效**：`server/.env` 里 `MODEL_*` 的字段拼写有误会被忽略并打 warning（`docker logs noschat-api | grep 模型`），`id` 缺失的条目会被跳过；改 `server/.env` 后需要 `docker compose up -d api` 重建容器重新注入变量。
+7. **前端提示「今日输出 token 已达上限」**：当日额度已用尽（只算模型输出，输入不计）。等 `resetAt` 时刻自动重置即可；用 curl 直接调接口同样会拿到 `402`，这不是前端限制。
+8. **登录提示「操作过于频繁」**：触发了账号或 IP 限流，按响应里的 `Retry-After` 秒数重试；若正常使用也被误伤，把 `LOGIN_RATE_LIMIT_*` 调大。
+9. **所有客户端 IP 看起来相同**：容器部署下 `FORWARDED_ALLOW_IPS` 没设为 `*`，`X-Forwarded-For` 被忽略。见上文环境变量表中的说明。
+10. **Redis 没启动会怎样**：不影响使用。缓存回源数据库、限流降级为进程内兜底，`/health` 显示 `"redis":"down"`；本地开发可直接把 `REDIS_URL` 留空。
 
 ## 许可证
 

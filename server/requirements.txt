@@ -12,6 +12,10 @@ bcrypt>=4.2
 PyJWT>=2.9
 aiosmtplib>=3.0
 openai>=1.54
+# Redis：缓存 + 限流（未配置 REDIS_URL 时自动降级为进程内模式）
+redis>=5.0
+# zoneinfo 时区数据（slim 镜像不保证带系统 tzdata）
+tzdata>=2024.1
 python-multipart>=0.0.12
 
 # 测试/联调（tests/smoke_api.py）

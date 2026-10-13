@@ -15,28 +15,40 @@ import {
   UNAUTHORIZED_EVENT
 } from '../api/client.js'
 
+const initialToken = getToken() || null
+
 const state = reactive({
   user: loadUser(),
-  token: getToken() || null,
+  token: initialToken,
   isLoading: false,
-  initialized: false,
+  // 是否已向后端确认过登录态：仅当后端返回成功/明确失败后才为 true。
+  // 存在令牌但尚未确认时，界面显示校验态而不是直接进入聊天界面。
+  sessionChecked: !initialToken,
   // 最近一次鉴权是否为「验证码登录自动注册」
   lastAuthIsNew: false,
   // 是否需要提示设置昵称（自动注册且当前昵称仍为邮箱）
   needsNicknamePrompt: false
 })
 
-/** 令牌失效（后端返回 401）时同步清理本地状态 */
-window.addEventListener(UNAUTHORIZED_EVENT, () => {
+/** 清空本地登录态（不发请求）；401 与主动登出共用 */
+function clearLocalSession() {
   state.user = null
   state.token = null
-  state.initialized = false
+  state.sessionChecked = true
+  state.lastAuthIsNew = false
+  state.needsNicknamePrompt = false
+  clearAuthStorage()
+}
+
+/** 令牌失效（后端返回 401）时同步清理本地状态 */
+window.addEventListener(UNAUTHORIZED_EVENT, () => {
+  clearLocalSession()
 })
 
 function applySession({ token, user, isNewUser = false }, { nicknamePrompt = false } = {}) {
   state.token = token
   state.user = user
-  state.initialized = true
+  state.sessionChecked = true
   state.lastAuthIsNew = Boolean(isNewUser)
   state.needsNicknamePrompt = Boolean(nicknamePrompt)
   saveToken(token)
@@ -51,6 +63,8 @@ export function useAuth() {
   const authLoading = computed(() => state.isLoading)
   const lastAuthIsNew = computed(() => state.lastAuthIsNew)
   const needsNicknamePrompt = computed(() => state.needsNicknamePrompt)
+  /** 登录态是否已由后端确认（false 且存在令牌时应展示校验态） */
+  const sessionReady = computed(() => state.sessionChecked)
 
   /** 发送邮箱验证码（register 注册 / login 验证码登录 / reset 找回密码） */
   async function sendCode({ email, purpose = 'register' }) {
@@ -114,33 +128,40 @@ export function useAuth() {
 
   /** 拉取当前用户（令牌存在时可校验登录态） */
   async function fetchMe() {
-    if (!state.token) return null
+    if (!state.token) {
+      state.sessionChecked = true
+      return null
+    }
     try {
       const user = await authApi.fetchMe()
       state.user = user
-      state.initialized = true
       saveUser(user)
       return user
     } catch (error) {
-      // 401 已由客户端统一清理；其它错误保留现状
-      if (error?.status === 401) logout()
+      // 401 说明令牌已失效：本地清理即可，不再调用登出接口（那会再挨一次 401）
+      if (error?.status === 401) clearLocalSession()
       return null
+    } finally {
+      // 无论成功还是失败，都算「已向后端确认过」，界面可以离开校验态
+      state.sessionChecked = true
     }
   }
 
-  /** 退出登录 */
+  /**
+   * 退出登录：先请求后端撤销该账号全部令牌，再清空本地状态。
+   * 顺序很关键 —— client.js 在首个 await 之前同步读取 localStorage 里的令牌，
+   * 因此必须先发起请求再清理；网络失败也不影响本地退出。
+   */
   function logout() {
-    state.user = null
-    state.token = null
-    state.initialized = false
-    clearAuthStorage()
+    const pending = state.token ? authApi.logout().catch(() => {}) : Promise.resolve()
+    clearLocalSession()
+    return pending
   }
 
   /** 保存昵称（留空时由后端回退为邮箱） */
   async function saveNickname(nickname) {
     const user = await authApi.updateProfile({ nickname: (nickname || '').trim() })
     state.user = user
-    state.initialized = true
     saveUser(user)
     return user
   }
@@ -165,6 +186,7 @@ export function useAuth() {
     currentUser,
     authToken,
     authLoading,
+    sessionReady,
     lastAuthIsNew,
     needsNicknamePrompt,
 
@@ -182,7 +204,7 @@ export function useAuth() {
   }
 }
 
-// 已有令牌但本地缺少用户信息时，后台补拉一次
-if (state.token && !state.user) {
+// 已有令牌时，后台补拉一次以向后端确认登录态（失败会被 401 处理清空）
+if (state.token) {
   void useAuth().fetchMe()
 }
